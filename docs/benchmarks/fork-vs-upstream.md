@@ -66,3 +66,17 @@ Same scripts (`run.sh` for up / up-nosimd / fork, then `bench.sh`) but **N=7** (
 wasm fork vs upstream as shipped (SIMD off): **~18 % faster on 4:2:0** (72.3→59.2), **~16 % on 4:4:4** (74.2→62.5). Against upstream with SIMD on: ~16 % (70.8→59.2) and ~15 % (73.4→62.5).
 The earlier run measured ~20 % and ~12 %. The ranges overlap with that run, so the SIMD gain still holds.
 No conversion code changed between `53d7248` and `2086529`.
+
+## Apple M4 Pro rerun (fork 53d0def vs upstream cee1feb)
+
+Run by the maintainer on a MacBook Pro (Apple M4 Pro, macOS Darwin 27.0.0, Node v22.22.0, rustc 1.99.0), `N=9 ./bench.sh`, 2026-10-13. Checksums are identical across all builds.
+
+| variant | 4:2:0 median [min–max] ms | 4:4:4 median [min–max] ms |
+|---|---|---|
+| native-up | 0.56 [0.54–0.66] | 0.57 [0.54–0.61] |
+| native-fork | 0.53 [0.52–1.04] | 0.62 [0.50–0.69] |
+| wasm-up-nosimd (as shipped) | 13.71 [13.68–13.77] | 13.75 [13.69–13.84] |
+| wasm-up (simd128 flag) | 13.77 [13.71–14.05] | 13.80 [13.69–13.86] |
+| wasm-fork | 12.25 [12.15–12.49] | 12.05 [11.95–12.14] |
+
+On M4 Pro the fork's wasm conversion is ~11% faster for 4:2:0 and ~12% for 4:4:4 than upstream as shipped. The simd128 flag alone does nothing for upstream's code, so the gain comes from the fork's conversion code. Native is unchanged (control).
