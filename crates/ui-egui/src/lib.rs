@@ -2145,7 +2145,7 @@ impl eframe::App for FilmcraftApp {
                 let _ = w.send(json!({"ok": true, "result": null}));
             }
         }
-        if self.frames.queue_len() > 0 {
+        if self.frames.queue_len() > 0 || self.frames.repaint_requested() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
