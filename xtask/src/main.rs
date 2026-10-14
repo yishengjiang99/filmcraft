@@ -359,6 +359,10 @@ fn web(args: &[String]) -> Result<(), String> {
             flags.push('\u{1f}');
         }
         flags.push_str("-C\u{1f}target-feature=+atomics,+bulk-memory,+mutable-globals,+simd128\u{1f}--cfg\u{1f}fc_wasm_threads");
+        // The module must import a *shared* memory (created by the JS glue), or std's
+        // thread support dies at the first spawn with "Int32Array is not a shared
+        // typed array". --shared-memory requires explicit initial/max sizes.
+        flags.push_str("\u{1f}-C\u{1f}link-arg=--import-memory\u{1f}-C\u{1f}link-arg=--export-memory\u{1f}-C\u{1f}link-arg=--shared-memory\u{1f}-C\u{1f}link-arg=--initial-memory=67108864\u{1f}-C\u{1f}link-arg=--max-memory=2147483648");
         b.env("CARGO_ENCODED_RUSTFLAGS", flags);
         run(&mut b).map_err(|e| format!("threaded web build failed (nightly toolchain with wasm32 target + rust-src required): {e}"))?;
         let mt_wasm = mt_target.join("wasm32-unknown-unknown").join(dir).join("filmcraft_web.wasm");
