@@ -349,8 +349,10 @@ fn web(args: &[String]) -> Result<(), String> {
     let mut mt_build = String::new();
     if threads {
         let mt_target = target_dir().join("web-mt");
-        let mut b = Command::new(env!("CARGO"));
-        b.args(["+nightly", "build", "-Z", "build-std=std,panic_abort", "--target", "wasm32-unknown-unknown", "-p", "filmcraft-web", "--profile", profile]);
+        // Through rustup: `env!("CARGO")` names the current toolchain's own cargo
+        // binary, which does not understand a `+nightly` argument.
+        let mut b = Command::new("rustup");
+        b.args(["run", "nightly", "cargo", "build", "-Z", "build-std=std,panic_abort", "--target", "wasm32-unknown-unknown", "-p", "filmcraft-web", "--profile", profile]);
         b.env("CARGO_TARGET_DIR", &mt_target);
         let mut flags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
         if !flags.is_empty() {
