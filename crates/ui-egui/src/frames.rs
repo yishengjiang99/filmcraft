@@ -503,6 +503,11 @@ impl FrameServer {
         self.shared.workers
     }
 
+    /// Worker threads that actually started (0 on single-threaded wasm).
+    pub fn live_workers(&self) -> usize {
+        self.shared.live_workers.load(Ordering::Relaxed)
+    }
+
     /// (cached images, their bytes, cached GPU plans, their bytes).
     pub fn cache_entries(&self) -> (usize, usize, usize, usize) {
         let (n, b) = {

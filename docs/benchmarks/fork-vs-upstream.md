@@ -10,7 +10,7 @@
 - **Fixes:** none.
 
 ## Method
-`main.rs` builds a 1920×1080 Rec.709 limited-range 8-bit YUV frame from a fixed LCG seed, in 4:2:0 and 4:4:4. It runs `VideoFrame::to_rgba8()` 3 times as warm-up, then times 20 iterations on native or 10 on wasm. The reported value is ms per frame. Each variant runs 9 times in sequence and we report the median, min and max. A position-weighted checksum of the output checks that results are bit-identical.
+`main.rs` builds a 1920×1080 Rec.709 limited-range 8-bit YUV frame from a fixed LCG seed, in 4:2:0 and 4:4:4. It runs `VideoFrame::to_rgba8()` 3 times as warm-up, then times 20 iterations on native or 10 on wasm. The reported value is ms per frame. Each variant runs N times in sequence (`bench.sh` default N=7; the run below used N=9) and we report the median, min and max. A position-weighted checksum of the output checks that results are bit-identical.
 
 Variants:
 - **native-up / native-fork:** x86_64 release build. The native code path is unchanged in the fork, so this is a control.
@@ -63,6 +63,6 @@ Same scripts (`run.sh` for up / up-nosimd / fork, then `bench.sh`) but **N=7** (
 | wasm-up | 70.81 [68.19–73.65] | 73.43 [71.67–76.53] |
 | wasm-fork | 59.22 [57.76–63.07] | 62.46 [60.86–66.37] |
 
-wasm fork vs upstream as shipped: **~16 % faster on 4:2:0** (70.8→59.2), **~15 % on 4:4:4** (73.4→62.5).
+wasm fork vs upstream as shipped (SIMD off): **~18 % faster on 4:2:0** (72.3→59.2), **~16 % on 4:4:4** (74.2→62.5). Against upstream with SIMD on: ~16 % (70.8→59.2) and ~15 % (73.4→62.5).
 The earlier run measured ~20 % and ~12 %. The ranges overlap with that run, so the SIMD gain still holds.
 No conversion code changed between `53d7248` and `2086529`.
