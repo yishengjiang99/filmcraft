@@ -289,6 +289,15 @@ fn web(args: &[String]) -> Result<(), String> {
     let profile = if dev { "dev" } else { "release" };
     let mut build = Command::new(env!("CARGO"));
     build.args(["build", "--target", "wasm32-unknown-unknown", "-p", "filmcraft-web", "--profile", profile]);
+    // Wasm SIMD is stable and needs no cross-origin isolation: enable it for every web
+    // build so the codec/colour kernels compiled under `target_feature = "simd128"` run
+    // (docs/web-optimization-plan.md, phase 1). Appended to any caller's rustflags.
+    let mut rustflags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    if !rustflags.is_empty() {
+        rustflags.push('\u{1f}');
+    }
+    rustflags.push_str("-C\u{1f}target-feature=+simd128");
+    build.env("CARGO_ENCODED_RUSTFLAGS", rustflags);
     run(&mut build)?;
     let out = Command::new("wasm-bindgen")
         .arg("--version")
@@ -312,7 +321,7 @@ fn web(args: &[String]) -> Result<(), String> {
         // optional: smaller and faster (binaryen); skipped when not installed
         let opt = dist.join("filmcraft_web_opt.wasm");
         run(Command::new("wasm-opt")
-            .args(["-O2", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-sign-ext", "--enable-mutable-globals"])
+            .args(["-O2", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-sign-ext", "--enable-mutable-globals", "--enable-simd"])
             .arg(&bg)
             .arg("-o")
             .arg(&opt))?;

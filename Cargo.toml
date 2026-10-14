@@ -81,6 +81,9 @@ rfd = "0.17"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# `fc_wasm_threads` is set by `cargo xtask web --threads` (RUSTFLAGS --cfg) for the
+# threaded wasm build only; see docs/web-optimization-plan.md.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fc_wasm_threads)"] }
 
 [workspace.lints.clippy]
 dbg_macro = "warn"
