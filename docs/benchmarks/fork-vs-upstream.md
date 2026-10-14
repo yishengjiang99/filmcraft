@@ -49,3 +49,20 @@ What the numbers mean:
 - **Web bundle size and startup:** a full `cargo xtask web` needs wasm-bindgen plus a long build, and was skipped.
 - **Full workspace test suite:** only the changed crate (frame) was tested.
 - **Native-only crates:** unchanged in the fork.
+
+## Rerun 2026-10-13 21:21 PT: fork `2086529` vs upstream `cee1feb`
+
+Same scripts (`run.sh` for up / up-nosimd / fork, then `bench.sh`) but **N=7** (the `bench.sh` default) instead of 9.
+8 vCPU box, 1-min load 0.12 → 1.19 during the run. Checksums are identical across builds.
+
+| variant | 4:2:0 median [min–max] ms | 4:4:4 median [min–max] ms |
+|---|---|---|
+| native-up | 4.58 [4.42–4.85] | 4.45 [4.17–4.77] |
+| native-fork | 4.44 [4.21–4.64] | 4.17 [3.95–4.43] |
+| wasm-up-nosimd | 72.30 [70.61–76.83] | 74.20 [71.80–80.83] |
+| wasm-up | 70.81 [68.19–73.65] | 73.43 [71.67–76.53] |
+| wasm-fork | 59.22 [57.76–63.07] | 62.46 [60.86–66.37] |
+
+wasm fork vs upstream as shipped: **~16 % faster on 4:2:0** (70.8→59.2), **~15 % on 4:4:4** (73.4→62.5).
+The earlier run measured ~20 % and ~12 %. The ranges overlap with that run, so the SIMD gain still holds.
+No conversion code changed between `53d7248` and `2086529`.
