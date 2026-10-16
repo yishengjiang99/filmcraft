@@ -52,8 +52,23 @@ against multi-minute runs). wall ± MAD. Stage times are the exporter's own coun
 - **Correctness**: every output passes `validate-export.mjs` (A/V sync 0.02 ms, frame counts,
   `-xerror`, colour tags; Y-PSNR vs the CLI reference 46–55 dB, SSIM ≥ 0.98).
 
+## 2026-10-16: phase 1 + 3 (label `phase1`, `bd13e6c8`)
+
+WebCodecs hardware H.264 encoder, OPFS streaming sink, CPU compositor (unchanged).
+
+| config | runs | wall s | fps | realtime | UI p95 ms | LoAF blocking s | wasm peak MiB | render / encode / convert s | Y-PSNR dB (min) |
+|---|---|---|---|---|---|---|---|---|---|
+| P1s-h264-hardware-cpu-opfs-mt | 3+1w | 7.1 ± 0.0 | 25.19 | 0.840 | 42 | 0 | 533 | 4.5 / 1.6 / 1.5 | 48.09 (43.77) |
+| P2s-h264-hardware-cpu-opfs-mt | 2 | 133.8 ± 0.0 | 2.69 | 0.090 | 658 | 113 | 981 | 128.4 / 3.3 / 3.1 | 47.19 (43.54) |
+
+vs baseline: P1s 23.6 → 7.1 s (3.3×), UI p95 309 → 42 ms; P2s 168.2 → 133.8 s (1.26×), wasm peak
+1400 → 981 MiB. Encode per 1080p frame 99 ms → 9 ms; P2s is now 96 % CPU render. Quality is up
+slightly (hardware encoder at the same bitrate). The software path (`?softenc` / `encoder:
+software`) is byte-identical to the baseline.
+
 ## Iteration log
 
 | # | Label | Hypothesis | Result | Decision |
 |---|---|---|---|---|
 | 0 | `baseline` | – (harness + reference numbers) | table above | reference for every later claim |
+| 1 | `phase1` | WebCodecs hardware encode removes the ~100 ms/frame encode: P1s ≥ 3×, P2s ~1.3× (render-bound); streaming cuts wasm memory | P1s 3.3×, P2s 1.26×, wasm −14 % / −30 %, PSNR +0.6–0.7 dB, all valid | kept (`bd13e6c8`) |
