@@ -1,7 +1,7 @@
 //! Development tool: encode synthetic (or lavfi) content and verify against ffmpeg.
 //!
 //! `cargo run --release -p filmcraft-h264enc --example h264enc_synth -- W H FRAMES [profile] [preset] [bframes] [rate] [slices] [src]`
-//! profile: baseline|main|high, preset: speed|balanced|quality, rate: qpN | crfN | cbrN | vbrN
+//! profile: baseline|main|high, preset: speed|balanced|quality, rate: qpN | crfN | cbrN | vbrN, src: synth | testsrc2 | mandelbrot | yuv:FILE (raw yuv420p)
 #[path = "../tests/common/mod.rs"]
 mod common;
 
@@ -50,8 +50,21 @@ fn main() {
     }
     // PERF=k: generate only k distinct pictures and cycle them (for long speed runs without verification).
     let distinct = std::env::var("PERF").ok().map_or(n, |k| k.parse::<usize>().unwrap().min(n));
-    let base: Vec<common::Yuv> =
-        if src_kind == "synth" { (0..distinct).map(|t| common::synth(w, h, t)).collect() } else { common::ffmpeg_source(&src_kind, w, h, distinct) };
+    let base: Vec<common::Yuv> = if src_kind == "synth" {
+        (0..distinct).map(|t| common::synth(w, h, t)).collect()
+    } else if let Some(path) = src_kind.strip_prefix("yuv:") {
+        // raw yuv420p file (e.g. `ffmpeg -i clip.mov -frames:v 60 -pix_fmt yuv420p -f rawvideo clip.yuv`)
+        let raw = std::fs::read(path).unwrap();
+        let fs = w * h * 3 / 2;
+        raw.chunks_exact(fs)
+            .take(distinct)
+            .map(|c| common::Yuv { w, h, y: c[..w * h].to_vec(), u: c[w * h..w * h * 5 / 4].to_vec(), v: c[w * h * 5 / 4..].to_vec() })
+            .collect()
+    } else {
+        common::ffmpeg_source(&src_kind, w, h, distinct)
+    };
+    let distinct = base.len().min(distinct);
+    let n = if std::env::var("PERF").is_ok() { n } else { n.min(distinct) };
     let perf = distinct < n;
     let frames: Vec<&common::Yuv> = (0..n).map(|i| &base[i % distinct]).collect();
     let dir = common::out_dir("dev");

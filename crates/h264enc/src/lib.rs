@@ -25,6 +25,7 @@ mod cavlc;
 mod deblock;
 mod dsp;
 mod intra;
+mod kernels;
 mod lookahead;
 mod mbinfo;
 mod nal;
