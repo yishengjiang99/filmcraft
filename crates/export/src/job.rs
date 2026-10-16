@@ -43,6 +43,17 @@
 //!   after pulling, before a frame is encoded (the batch is then not encoded; its audio is not
 //!   recovered, see the known issue above) and the prefetched batch is dropped too, because the step
 //!   did not advance `next`.
+//!
+//! # Asynchronous GPU rendering (the web)
+//!
+//! A [`FrameRenderer`](crate::FrameRenderer) that cannot block on its read-back answers
+//! [`FrameOutcome::Pending`](crate::FrameOutcome) for a frame it has submitted: the pipeline marks
+//! the pending flag for it, like media still loading. A sequential step keeps the frames of the
+//! batch that did finish (`partial`) and renders only the missing ones on the next step, so a
+//! frame collected from the GPU is never submitted twice. Before rendering a batch, the step
+//! prefetches the next one ([`Pipeline::prefetch`]), so the GPU draws batch *k+1* while the CPU
+//! converts and encodes batch *k*.
+//!
 //! * **Cancellation** is checked at the start of every step, which drops the prefetched frames;
 //!   the prefetch is not started once it is set.
 //! * **Panics.** The prefetch runs under `catch_unwind` and becomes an [`ExportError`]; a panic of
@@ -128,11 +139,31 @@ fn render_batch(pipe: &Pipeline, f: i64, end: i64, sources: &dyn SourceProvider)
     (!pending.load(Ordering::Relaxed)).then_some(frames)
 }
 
+/// A batch of which some frames are rendered and some were not ready (sequential steps).
+struct Partial {
+    /// First frame.
+    first: i64,
+    frames: Vec<Option<Frame>>,
+}
+
+/// Render the frames of `part` that are missing, in parallel. `Err` with what is done so far when
+/// a frame was not ready (its source was loading, or the GPU still has it in flight).
+fn render_partial(pipe: &Pipeline, mut part: Partial, sources: &dyn SourceProvider) -> std::result::Result<Vec<Frame>, Partial> {
+    let first = part.first;
+    part.frames.par_iter_mut().enumerate().filter(|(_, slot)| slot.is_none()).for_each(|(k, slot)| {
+        let frame = pipe.frame(first.saturating_add(k as i64), sources);
+        if !filmcraft_media::pending::take() {
+            *slot = Some(frame);
+        }
+    });
+    if part.frames.iter().all(Option::is_some) { Ok(part.frames.into_iter().flatten().collect()) } else { Err(part) }
+}
+
 /// What encoding a batch came to.
 enum Encoded {
     Done,
-    /// Audio media was not ready: nothing was encoded, run the batch again.
-    Pending,
+    /// Audio media was not ready: nothing was encoded (the frames come back), run the batch again.
+    Pending(Vec<Frame>),
 }
 
 /// What one [`Exporter::step`] did.
@@ -155,12 +186,16 @@ pub struct Exporter {
     /// Next frame to encode.
     next: i64,
     batch: i64,
+    /// Frames the GPU renderer keeps in flight (1: synchronous or none; see the module docs).
+    in_flight: usize,
     /// Render the next batch while this one is encoded (see the module docs).
     overlap: bool,
     /// Bytes of frames the overlap may keep in flight ([`IN_FLIGHT_BUDGET`]; tests lower it).
     budget: u64,
     /// The batch starting at `next`, already rendered.
     ahead: Option<Ahead>,
+    /// The batch starting at `next`, partly rendered (a sequential step that hit a pending frame).
+    partial: Option<Partial>,
     /// Steps that rendered a batch alongside the encoding of the previous one.
     overlapped_steps: u64,
     brand: Brand,
@@ -257,6 +292,7 @@ impl Exporter {
         settings.h264_pass = if two_pass { H264Pass::First } else { H264Pass::Single };
         let range = export_range(&project, seq, &settings)?;
         let pipe = Arc::new(Pipeline::new(project.clone(), seq, &settings, hdr_out)?);
+        let in_flight = pipe.frames_in_flight();
         let (f0, f1) = frame_span(pipe.rate, range);
         let nframes = (f1 - f0) as u64;
         if !settings.part_of_batch {
@@ -282,9 +318,11 @@ impl Exporter {
             f1,
             next: f0,
             batch: rayon::current_num_threads().clamp(2, 16) as i64,
+            in_flight,
             overlap: true,
             budget: IN_FLIGHT_BUDGET,
             ahead: None,
+            partial: None,
             overlapped_steps: 0,
             brand,
             venc,
@@ -315,6 +353,13 @@ impl Exporter {
         self.batch = n.max(1);
     }
 
+    /// Frames per step that keep an asynchronous GPU renderer busy: half of what it keeps in flight
+    /// (the other half is the next batch, prefetched), `None` for a synchronous renderer or none.
+    /// The web uses it instead of its 1-frame steps when exports render on the GPU.
+    pub fn async_batch(&self) -> Option<i64> {
+        (self.in_flight > 1).then(|| i64::try_from(self.in_flight / 2).unwrap_or(1).max(1))
+    }
+
     /// Render the next batch while encoding the current one (the default natively; the web, with
     /// no threads, never does). Off gives the sequential render-then-encode; the file is the same.
     pub fn set_overlap(&mut self, on: bool) {
@@ -331,9 +376,10 @@ impl Exporter {
     }
 
     /// Whether steps overlap rendering with encoding now: switched on, a pool with more than one
-    /// thread, and not on wasm.
+    /// thread, no asynchronous GPU renderer, and not on wasm.
     pub fn overlapping(&self) -> bool {
-        self.overlap && !cfg!(target_arch = "wasm32") && rayon::current_num_threads() > 1
+        // (an asynchronous GPU renderer keeps frames in flight across steps instead)
+        self.overlap && self.in_flight <= 1 && !cfg!(target_arch = "wasm32") && rayon::current_num_threads() > 1
     }
 
     /// Steps so far that rendered the next batch alongside the encoding of the current one.
@@ -452,6 +498,7 @@ impl Exporter {
     pub fn step(&mut self, sources: &dyn SourceProvider, progress: &Progress) -> Result<Step> {
         if progress.cancel.load(Ordering::Relaxed) {
             self.ahead = None;
+            self.partial = None;
             return Err(ExportError::Cancelled);
         }
         let _ = filmcraft_media::pending::take();
@@ -483,6 +530,7 @@ impl Exporter {
             return self.step_batch(sources, progress);
         }
         self.ahead = None;
+        self.partial = None;
         if self.first_pass {
             // end of the analysis pass: encode for real with its statistics
             let _ = self.venc.flush()?;
@@ -559,12 +607,32 @@ impl Exporter {
     fn step_batch(&mut self, sources: &dyn SourceProvider, progress: &Progress) -> Result<Step> {
         let (f, frames) = match self.ahead.take() {
             Some(a) if a.first == self.next => (a.first, a.frames),
-            _ => {
+            _ if self.overlapping() => {
                 let (f, end) = (self.next, self.next.saturating_add(self.batch_len()).min(self.f1));
                 let pipe = &self.pipe;
                 match timed(Stage::Render, || render_batch(pipe, f, end, sources)) {
                     Some(frames) => (f, frames),
                     None => return Ok(Step::Pending),
+                }
+            }
+            _ => {
+                let (f, end) = (self.next, self.next.saturating_add(self.batch_len()).min(self.f1));
+                let len = usize::try_from(end.saturating_sub(f)).unwrap_or(0);
+                let part = match self.partial.take() {
+                    Some(p) if p.first == f && p.frames.len() == len => p,
+                    _ => Partial { first: f, frames: (0..len).map(|_| None).collect() },
+                };
+                // the GPU draws the next batch while this one is collected, converted and encoded
+                if self.in_flight > 1 && !progress.cancel.load(Ordering::Relaxed) {
+                    self.pipe.prefetch(f, end.saturating_add(self.batch_len()).min(self.f1), sources);
+                }
+                let pipe = &self.pipe;
+                match timed(Stage::Render, || render_partial(pipe, part, sources)) {
+                    Ok(frames) => (f, frames),
+                    Err(part) => {
+                        self.partial = Some(part);
+                        return Ok(Step::Pending);
+                    }
                 }
             }
         };
@@ -577,7 +645,11 @@ impl Exporter {
             (end < self.f1 && self.overlapping() && !progress.cancel.load(Ordering::Relaxed)).then(|| (end, end.saturating_add(self.batch_len()).min(self.f1)));
         let Some((a, b)) = plan else {
             return match self.encode_batch(f, frames, sources)? {
-                Encoded::Pending => Ok(Step::Pending),
+                Encoded::Pending(frames) => {
+                    // keep the rendered frames: the GPU would have to draw them again
+                    self.partial = Some(Partial { first: f, frames: frames.into_iter().map(Some).collect() });
+                    Ok(Step::Pending)
+                }
                 Encoded::Done => {
                     progress.done.fetch_add((end - f) as u64, Ordering::Relaxed);
                     self.next = end;
@@ -601,7 +673,7 @@ impl Exporter {
             note_stage(Stage::Wait, t.elapsed());
         }
         match encoded? {
-            Encoded::Pending => Ok(Step::Pending),
+            Encoded::Pending(_) => Ok(Step::Pending),
             Encoded::Done => {
                 self.overlapped_steps += 1;
                 progress.done.fetch_add((end - f) as u64, Ordering::Relaxed);
@@ -642,7 +714,7 @@ impl Exporter {
         }
         // taken right here, on the thread that pulled, before other work can touch the flag
         if filmcraft_media::pending::take() {
-            return Ok(Encoded::Pending);
+            return Ok(Encoded::Pending(frames));
         }
         let mut mixed = mixed.into_iter();
         for (k, frame) in frames.into_iter().enumerate() {

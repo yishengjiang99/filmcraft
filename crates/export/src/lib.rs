@@ -1062,6 +1062,13 @@ pub fn encoder_registered(f: EncoderFactory) -> bool {
 /// frame exactly as [`filmcraft_render::render_sequence`] would (same size, premultiplied
 /// linear-light RGBA), or `None` to let the CPU render this frame (no adapter, a plan the GPU
 /// cannot draw, any internal error): the CPU renderer is the reference and the fallback.
+///
+/// An **asynchronous** renderer (the web's WebGPU compositor, which must not block the browser's
+/// main thread on a read-back) overrides [`render_async`](Self::render_async): it submits the
+/// frame and answers [`FrameOutcome::Pending`] until the picture is back. The stepped
+/// [`Exporter`] then yields (`Step::Pending`) and asks for the same frame again on a later step;
+/// [`prefetch`](Self::prefetch) lets it submit the next frames early so several are in flight.
+/// The defaults keep a synchronous renderer exactly as it was.
 pub trait FrameRenderer: Send {
     fn render(
         &mut self,
@@ -1071,6 +1078,37 @@ pub trait FrameRenderer: Send {
         opts: filmcraft_render::RenderOptions,
         sources: &dyn SourceProvider,
     ) -> Option<filmcraft_render::Image>;
+
+    /// The frame at `t`: finished, still in flight (ask again later), or declined (the CPU
+    /// renders it). The default is [`render`](Self::render): finished or declined.
+    fn render_async(&mut self, project: &Project, seq: ItemId, t: Tick, opts: filmcraft_render::RenderOptions, sources: &dyn SourceProvider) -> FrameOutcome {
+        match self.render(project, seq, t, opts, sources) {
+            Some(img) => FrameOutcome::Ready(img),
+            None => FrameOutcome::Declined,
+        }
+    }
+
+    /// Start rendering the frame at `t`, which will be asked for soon ([`render_async`](Self::render_async)
+    /// collects it). Only a renderer that answers `Pending` needs it; the default does nothing.
+    fn prefetch(&mut self, _project: &Project, _seq: ItemId, _t: Tick, _opts: filmcraft_render::RenderOptions, _sources: &dyn SourceProvider) {}
+
+    /// Frames this renderer can keep in flight at once: more than 1 only for an asynchronous
+    /// renderer (the stepped exporter then renders batches of about half of it and prefetches
+    /// the next batch while it waits for the current one).
+    fn frames_in_flight(&self, _width: u32, _height: u32) -> usize {
+        1
+    }
+}
+
+/// What [`FrameRenderer::render_async`] came to for one frame.
+#[derive(Debug)]
+pub enum FrameOutcome {
+    /// The frame, as [`filmcraft_render::render_sequence`] would return it.
+    Ready(filmcraft_render::Image),
+    /// Submitted, not finished yet: ask again on a later step.
+    Pending,
+    /// Not for this renderer (a plan it cannot draw, an error, a lost device): the CPU renders it.
+    Declined,
 }
 
 /// Builds the frame renderer for one export, or `None` when this host cannot (no adapter).
@@ -1148,6 +1186,33 @@ pub struct GpuRenderStats {
 
 pub fn gpu_render_stats() -> GpuRenderStats {
     GpuRenderStats { frames: GPU_FRAMES.load(Ordering::Relaxed), fallbacks: GPU_FALLBACKS.load(Ordering::Relaxed) }
+}
+
+static LAST_GPU_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_CPU_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Which renderer drew the frames of the latest export (process-wide; counted from its start, so
+/// concurrent exports mix): frames from the registered GPU renderer and from the CPU reference
+/// renderer (GPU rendering off, declined frames and fallbacks alike). The web reports it as
+/// `filmcraft.info().export.compositor`.
+pub fn last_export_render_stats() -> ExportRenderCounts {
+    ExportRenderCounts { gpu: LAST_GPU_FRAMES.load(Ordering::Relaxed), cpu: LAST_CPU_FRAMES.load(Ordering::Relaxed) }
+}
+
+/// [`last_export_render_stats`]: frames of the latest export per renderer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExportRenderCounts {
+    pub gpu: u64,
+    pub cpu: u64,
+}
+
+pub(crate) fn note_export_start() {
+    LAST_GPU_FRAMES.store(0, Ordering::Relaxed);
+    LAST_CPU_FRAMES.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn note_export_frame(gpu: bool) {
+    if gpu { &LAST_GPU_FRAMES } else { &LAST_CPU_FRAMES }.fetch_add(1, Ordering::Relaxed);
 }
 pub fn register_audio_encoder(f: AudioEncoderFactory) {
     audio_factories().write().unwrap_or_else(|e| e.into_inner()).insert(0, f);
@@ -2077,7 +2142,8 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
             (n, frames)
         }
         f if f.is_image_sequence() || f == Format::Gif => {
-            let pipe = pipeline::Pipeline::new(project.clone(), seq, settings, false)?;
+            // rendered and written in one call: no step to come back for a frame in flight
+            let pipe = pipeline::Pipeline::new(project.clone(), seq, settings, false)?.synchronous_only();
             let (f0, f1) = frame_span(pipe.rate, range);
             let count = (f1 - f0) as u64;
             let (w, h) = (pipe.w, pipe.h);

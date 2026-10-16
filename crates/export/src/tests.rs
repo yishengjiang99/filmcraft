@@ -457,7 +457,166 @@ fn gpu_hook_scenarios() {
         assert_eq!(frame("adj-off", f), frame("adj-auto", f), "frame {f}: an adjustment layer frame is the CPU's");
     }
     assert_eq!((gpu_render_stats().frames, gpu_render_stats().fallbacks), (12, 12), "{:?}", gpu_render_stats());
+
+    // 6. An asynchronous renderer (the web's WebGPU read-back): every frame is Pending first and
+    //    Ready on a later step. The stepped export must give the same file as a synchronous
+    //    renderer drawing the same pictures, collect each frame once (no frame submitted twice),
+    //    prefetch ahead, and send declined frames and everything after a failure to the CPU.
+    let (p, seq, m) = project();
+    let run = |path: &str| -> (Vec<u8>, u32) {
+        let s = ExportSettings { format: Format::Mjpeg, path: tmp(path), gpu_rendering: crate::GpuRendering::Auto, ..Default::default() };
+        let prog = Progress::default();
+        let mut ex = crate::Exporter::new(p.clone(), seq, &s, &prog).unwrap();
+        ex.set_overlap(false);
+        ex.set_batch(ex.async_batch().unwrap_or(1));
+        let mut pendings = 0;
+        for _ in 0..10_000 {
+            match ex.step(&m, &prog).unwrap() {
+                crate::Step::Done(_) => return (std::fs::read(tmp(path)).unwrap(), pendings),
+                crate::Step::Pending => {
+                    pendings += 1;
+                    ASYNC.with(|a| a.borrow_mut().tick());
+                }
+                crate::Step::Progress => {}
+            }
+        }
+        panic!("the export did not finish");
+    };
     crate::reset_frame_renderers_for_tests();
+    crate::register_frame_renderer(|| Some(Box::new(ShadeRenderer) as Box<dyn FrameRenderer>));
+    let (sync_file, _) = run("shade-sync.mov");
+    crate::reset_frame_renderers_for_tests();
+    ASYNC.with(|a| *a.borrow_mut() = AsyncState::default());
+    crate::register_frame_renderer(|| Some(Box::new(AsyncShadeRenderer) as Box<dyn FrameRenderer>));
+    let (async_file, pendings) = run("shade-async.mov");
+    assert_eq!(sync_file, async_file, "an asynchronous renderer must give the same file");
+    assert!(pendings > 0, "the exporter never waited for the renderer");
+    ASYNC.with(|a| {
+        let a = a.borrow();
+        assert!(a.submitted.values().all(|&n| n == 1), "a frame was submitted twice: {:?}", a.submitted);
+        assert_eq!(a.submitted.len(), 24, "every frame of the 1 s export went to the renderer once");
+        assert!(a.prefetched > 0, "nothing was prefetched");
+        assert!(pendings < 24, "batches in flight, not one frame per wait ({pendings} waits)");
+    });
+    ASYNC.with(|a| assert_eq!(a.borrow().collected, 24, "every frame was collected from the renderer"));
+    // fails after 10 frames: the rest of the export renders on the CPU and still finishes
+    ASYNC.with(|a| *a.borrow_mut() = AsyncState { fail_after: Some(10), ..Default::default() });
+    let (failed_file, _) = run("shade-async-fail.mov");
+    ASYNC.with(|a| assert_eq!(a.borrow().collected, 10, "no frame is collected after the failure"));
+    assert_ne!(failed_file, async_file, "the frames after the failure are the CPU's");
+    crate::reset_frame_renderers_for_tests();
+}
+
+/// Pictures that depend on the frame time (a grey level), so out-of-order frames would show.
+fn shade(t: Tick) -> filmcraft_render::Image {
+    let mut img = filmcraft_render::Image::new(320, 180);
+    let v = (t.0 / (TICKS_PER_SECOND / 24)) as f32 / 24.0;
+    for p in img.px.as_chunks_mut::<4>().0 {
+        p.copy_from_slice(&[v, 1.0 - v, 0.25, 1.0]);
+    }
+    img
+}
+
+struct ShadeRenderer;
+
+impl FrameRenderer for ShadeRenderer {
+    fn render(&mut self, _: &Project, _: ItemId, t: Tick, _: filmcraft_render::RenderOptions, _: &dyn SourceProvider) -> Option<filmcraft_render::Image> {
+        Some(shade(t))
+    }
+}
+
+/// The asynchronous renderer's state.
+#[derive(Default)]
+struct AsyncState {
+    /// Frames submitted (by tick) and how often.
+    submitted: std::collections::BTreeMap<i64, u32>,
+    /// Submitted frames and whether their "read-back" finished (on the next wait).
+    in_flight: std::collections::BTreeMap<i64, bool>,
+    prefetched: u32,
+    /// Answer Declined for every frame after this many were collected (a lost device).
+    fail_after: Option<u32>,
+    collected: u32,
+}
+
+impl AsyncState {
+    /// The event loop ran: every submitted read-back finished.
+    fn tick(&mut self) {
+        for done in self.in_flight.values_mut() {
+            *done = true;
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.fail_after.is_some_and(|n| self.collected >= n)
+    }
+
+    fn submit(&mut self, t: Tick) -> bool {
+        if self.in_flight.len() >= 8 || self.in_flight.contains_key(&t.0) {
+            return false;
+        }
+        *self.submitted.entry(t.0).or_default() += 1;
+        self.in_flight.insert(t.0, false);
+        true
+    }
+}
+
+/// (a static, not a thread-local: the batch's frames render on the rayon pool)
+static ASYNC_STATE: std::sync::Mutex<Option<AsyncState>> = std::sync::Mutex::new(None);
+
+struct AsyncCell;
+
+impl AsyncCell {
+    fn with<R>(&self, f: impl FnOnce(&std::cell::RefCell<AsyncState>) -> R) -> R {
+        let mut g = ASYNC_STATE.lock().unwrap();
+        let cell = std::cell::RefCell::new(g.take().unwrap_or_default());
+        let r = f(&cell);
+        *g = Some(cell.into_inner());
+        r
+    }
+}
+
+static ASYNC: AsyncCell = AsyncCell;
+
+struct AsyncShadeRenderer;
+
+impl FrameRenderer for AsyncShadeRenderer {
+    fn render(&mut self, _: &Project, _: ItemId, _: Tick, _: filmcraft_render::RenderOptions, _: &dyn SourceProvider) -> Option<filmcraft_render::Image> {
+        None
+    }
+
+    fn render_async(&mut self, _: &Project, _: ItemId, t: Tick, _: filmcraft_render::RenderOptions, _: &dyn SourceProvider) -> crate::FrameOutcome {
+        ASYNC.with(|a| {
+            let mut a = a.borrow_mut();
+            if a.failed() {
+                return crate::FrameOutcome::Declined;
+            }
+            match a.in_flight.get(&t.0) {
+                Some(true) => {
+                    a.in_flight.remove(&t.0);
+                    a.collected += 1;
+                    crate::FrameOutcome::Ready(shade(t))
+                }
+                Some(false) => crate::FrameOutcome::Pending,
+                None => {
+                    a.submit(t);
+                    crate::FrameOutcome::Pending
+                }
+            }
+        })
+    }
+
+    fn prefetch(&mut self, _: &Project, _: ItemId, t: Tick, _: filmcraft_render::RenderOptions, _: &dyn SourceProvider) {
+        ASYNC.with(|a| {
+            let mut a = a.borrow_mut();
+            if !a.failed() && a.submit(t) {
+                a.prefetched += 1;
+            }
+        });
+    }
+
+    fn frames_in_flight(&self, _: u32, _: u32) -> usize {
+        8
+    }
 }
 
 static PANICS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

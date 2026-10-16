@@ -12,7 +12,7 @@ use filmcraft_time::FrameRate;
 use rayon::prelude::*;
 
 use crate::settings::{ExportEffects, Placement, Scaling, TextOverlay};
-use crate::{ExportError, ExportSettings, FrameRenderer, GpuRendering, Result, build_frame_renderer, note_gpu_fallback, note_gpu_frame};
+use crate::{ExportError, ExportSettings, FrameOutcome, FrameRenderer, GpuRendering, Result, build_frame_renderer, note_gpu_fallback, note_gpu_frame};
 
 /// Where the rendered picture lands in the output frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -118,6 +118,9 @@ pub(crate) struct Pipeline {
     pub w: u32,
     pub h: u32,
     geom: Geometry,
+    /// Size of the rendered picture (before it is fitted into the output frame).
+    render_w: u32,
+    render_h: u32,
     opts: RenderOptions,
     pub hdr_out: bool,
     /// Keep straight alpha in the RGBA8 output instead of flattening over black.
@@ -171,6 +174,9 @@ impl Pipeline {
         } else {
             None
         };
+        if !settings.part_of_batch {
+            crate::note_export_start();
+        }
         let renderer = if settings.gpu_rendering == GpuRendering::Off {
             None
         } else {
@@ -199,6 +205,8 @@ impl Pipeline {
             w: r.width,
             h: r.height,
             geom,
+            render_w: w,
+            render_h: h,
             opts,
             hdr_out,
             alpha: settings.keeps_alpha(),
@@ -209,10 +217,12 @@ impl Pipeline {
     }
 
     /// Output frame `f` as straight sRGB RGBA8 at the output size, or for HDR exports the encoded
-    /// R'G'B' floats (3 per pixel).
+    /// R'G'B' floats (3 per pixel). When an asynchronous GPU renderer has the frame in flight, the
+    /// result is empty and [`filmcraft_media::pending`] is marked: the caller drops it and asks
+    /// again on a later step (as for media that is still loading).
     pub fn frame(&self, f: i64, sources: &dyn SourceProvider) -> (Vec<u8>, Vec<f32>) {
         let t = self.rate.tick_of(f);
-        // The registered GPU renderer goes first; `None` (no adapter, a plan the GPU cannot
+        // The registered GPU renderer goes first; `Declined` (no adapter, a plan the GPU cannot
         // draw, any internal error) falls back to the CPU reference renderer below. A frame the
         // planner hands back as one CPU image anyway (an adjustment layer, a complex transition,
         // HDR) does not take a pooled renderer: it would render on the CPU inside the pool, as
@@ -223,21 +233,27 @@ impl Pipeline {
                 let asked = web_time::Instant::now();
                 pool.with(|r| {
                     crate::note_lock_wait(asked.elapsed());
-                    r.render(&self.project, self.seq, t, self.opts, sources)
+                    r.render_async(&self.project, self.seq, t, self.opts, sources)
                 })
-                .flatten()
+                .unwrap_or(FrameOutcome::Declined)
             }
-            None => None,
+            None => FrameOutcome::Declined,
         };
         let img = match gpu {
-            Some(img) => {
+            FrameOutcome::Ready(img) => {
                 note_gpu_frame();
+                crate::note_export_frame(true);
                 img
             }
-            None => {
+            FrameOutcome::Pending => {
+                filmcraft_media::pending::mark();
+                return (Vec::new(), Vec::new());
+            }
+            FrameOutcome::Declined => {
                 if self.renderer.is_some() {
                     note_gpu_fallback();
                 }
+                crate::note_export_frame(false);
                 filmcraft_render::render_sequence(&self.project, self.seq, t, self.opts, sources)
             }
         };
@@ -265,6 +281,44 @@ impl Pipeline {
             limit_rgba8(&mut rgba, lim.min_percent, lim.max_percent);
         }
         (rgba, Vec::new())
+    }
+
+    /// Frames the GPU renderer can keep in flight (1 = synchronous or none, see
+    /// [`FrameRenderer::frames_in_flight`]).
+    pub fn frames_in_flight(&self) -> usize {
+        let Some(pool) = self.renderer.as_ref() else { return 1 };
+        let (w, h) = (self.render_w, self.render_h);
+        pool.with(|r| r.frames_in_flight(w, h)).unwrap_or(1).max(1)
+    }
+
+    /// Without an asynchronous GPU renderer (for exports that are not stepped: nothing would ask
+    /// again for a frame in flight). Their frames render on the CPU then.
+    pub(crate) fn synchronous_only(mut self) -> Self {
+        if self.frames_in_flight() > 1 {
+            self.renderer = None;
+        }
+        self
+    }
+
+    /// Let an asynchronous GPU renderer start on output frames `f0..f1` before they are asked for
+    /// ([`FrameRenderer::prefetch`]). Media still loading only starts loading here: such a frame
+    /// is not submitted, and the pending flag its planning raised is cleared.
+    pub fn prefetch(&self, f0: i64, f1: i64, sources: &dyn SourceProvider) {
+        let Some(pool) = self.renderer.as_ref() else { return };
+        let was = filmcraft_media::pending::take();
+        for f in f0..f1 {
+            let t = self.rate.tick_of(f);
+            if filmcraft_render::plan::is_cpu_frame(&self.project, self.seq, t) {
+                continue;
+            }
+            if pool.with(|r| r.prefetch(&self.project, self.seq, t, self.opts, sources)).is_none() {
+                break;
+            }
+        }
+        let _ = filmcraft_media::pending::take();
+        if was {
+            filmcraft_media::pending::mark();
+        }
     }
 
     /// Fit the rendered picture into the output frame.
