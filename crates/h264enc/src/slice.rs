@@ -138,6 +138,36 @@ struct Cand {
     cost: u64,
 }
 
+/// Luma residual coding result: levels per block (`B` blocks of `N` coefficients in scan order), nnz per
+/// 4x4 block and the reconstruction.
+struct LumaOut<const B: usize, const N: usize> {
+    lv: [[i16; N]; B],
+    nnz: [u8; 16],
+    ry: [u8; 256],
+}
+
+impl<const B: usize, const N: usize> LumaOut<B, N> {
+    fn new() -> Self {
+        LumaOut { lv: [[0; N]; B], nnz: [0; 16], ry: [0; 256] }
+    }
+}
+
+impl LumaOut<16, 16> {
+    fn store4(&self, c: &mut Cand) {
+        c.code.luma4 = self.lv;
+        c.info.nnz = self.nnz;
+        c.ry = self.ry;
+    }
+}
+
+impl LumaOut<4, 64> {
+    fn store8(&self, c: &mut Cand) {
+        c.code.luma8 = self.lv;
+        c.info.nnz = self.nnz;
+        c.ry = self.ry;
+    }
+}
+
 impl Cand {
     fn new() -> Box<Cand> {
         Box::new(Cand { code: MbCode::default(), info: MbInfo::default(), ry: [0; 256], ru: [0; 64], rv: [0; 64], cost: u64::MAX })
@@ -646,9 +676,10 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
         cbp
     }
 
-    /// Inter luma residual with the 4x4 transform. Returns luma cbp.
-    fn code_luma4(&self, src: &[u8; 256], pred: &[u8; 256], qp: u8, dz: Deadzone, decimate: bool, c: &mut Cand) -> u8 {
+    /// Inter luma residual with the 4x4 transform. Returns luma cbp and levels / nnz / reconstruction.
+    fn code_luma4(&self, src: &[u8; 256], pred: &[u8; 256], qp: u8, dz: Deadzone, decimate: bool) -> (u8, LumaOut<16, 16>) {
         let qt = self.f.qt;
+        let mut o = LumaOut::new();
         // all 16 blocks at once, lane = raster block index by * 4 + bx (see `kernels`)
         let mut co = kernels::fdct4_lanes(&kernels::residual4_16x16(src, pred));
         kernels::quant4_lanes(&mut co, qt, qp, dz, false);
@@ -666,7 +697,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
                 scan[k] = co[ZIGZAG4[k]][l] as i16;
             }
             score8[blk / 4] += decimate_score(&scan);
-            c.code.luma4[blk] = scan;
+            o.lv[blk] = scan;
         }
         let mut cbp = 0u8;
         let total: u32 = score8.iter().sum();
@@ -675,30 +706,31 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             for i in 0..4 {
                 let blk = b8 * 4 + i;
                 if kill {
-                    c.code.luma4[blk] = [0; 16];
+                    o.lv[blk] = [0; 16];
                     let (bx, by) = BLK4_XY[blk];
                     for row in co.iter_mut() {
                         row[by * 4 + bx] = 0;
                     }
                 }
-                if c.code.luma4[blk].iter().any(|&v| v != 0) {
+                if o.lv[blk].iter().any(|&v| v != 0) {
                     cbp |= 1 << b8;
                 }
             }
         }
         for blk in 0..16 {
             let (bx, by) = BLK4_XY[blk];
-            c.info.nnz[by * 4 + bx] = c.code.luma4[blk].iter().filter(|&&v| v != 0).count() as u8;
+            o.nnz[by * 4 + bx] = o.lv[blk].iter().filter(|&&v| v != 0).count() as u8;
         }
         // an all-zero block reconstructs to the prediction (its inverse transform is exactly 0)
         kernels::dequant4_lanes(&mut co, qt, qp, false);
-        kernels::recon4_16x16(pred, &kernels::idct4_lanes(&co), &mut c.ry);
-        cbp
+        kernels::recon4_16x16(pred, &kernels::idct4_lanes(&co), &mut o.ry);
+        (cbp, o)
     }
 
-    /// Inter luma residual with the 8x8 transform. Returns luma cbp.
-    fn code_luma8(&self, src: &[u8; 256], pred: &[u8; 256], qp: u8, dz: Deadzone, decimate: bool, c: &mut Cand) -> u8 {
+    /// Inter luma residual with the 8x8 transform. Returns luma cbp and levels / nnz / reconstruction.
+    fn code_luma8(&self, src: &[u8; 256], pred: &[u8; 256], qp: u8, dz: Deadzone, decimate: bool) -> (u8, LumaOut<4, 64>) {
         let qt = self.f.qt;
+        let mut o = LumaOut::new();
         // all four 8x8 blocks at once, lane = by * 2 + bx (see `kernels`)
         let mut co = kernels::fdct8_lanes(&kernels::residual8_16x16(src, pred));
         kernels::quant8_lanes(&mut co, qt, qp, dz);
@@ -709,21 +741,21 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
                 scan[k] = co[ZIGZAG8[k]][b8] as i16;
             }
             score[b8] = decimate_score(&scan);
-            c.code.luma8[b8] = scan;
+            o.lv[b8] = scan;
         }
         let total: u32 = score.iter().sum();
         let mut cbp = 0;
         for b8 in 0..4 {
             let (bx, by) = ((b8 & 1) * 2, (b8 >> 1) * 2);
             if decimate && (score[b8] < 4 || total < 6) {
-                c.code.luma8[b8] = [0; 64];
+                o.lv[b8] = [0; 64];
                 for row in co.iter_mut() {
                     row[b8] = 0;
                 }
             }
-            let nz = c.code.luma8[b8].iter().filter(|&&v| v != 0).count() as u8;
+            let nz = o.lv[b8].iter().filter(|&&v| v != 0).count() as u8;
             for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                c.info.nnz[(by + dy) * 4 + bx + dx] = nz;
+                o.nnz[(by + dy) * 4 + bx + dx] = nz;
             }
             if nz != 0 {
                 cbp |= 1 << b8;
@@ -731,50 +763,48 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
         }
         // an all-zero block reconstructs to the prediction (its inverse transform is exactly 0)
         kernels::dequant8_lanes(&mut co, qt, qp);
-        kernels::recon8_16x16(pred, &kernels::idct8_lanes(&co), &mut c.ry);
-        cbp
+        kernels::recon8_16x16(pred, &kernels::idct8_lanes(&co), &mut o.ry);
+        (cbp, o)
     }
 
     /// Code an inter candidate's residual given its luma/chroma prediction.
     fn code_inter(&self, src: &Src, py: &[u8; 256], pu: &[u8; 64], pv: &[u8; 64], qp: u8, c: &mut Cand) {
         let t8_allowed = self.f.p.t8x8;
+        let dec = self.f.p.decimate;
         let (use8, cbpl) = if t8_allowed && self.f.p.adaptive_t8 {
-            // Compare 4x4 and 8x8 transform by SSD + lambda * (approximate) bits, and keep the winner
-            // (identical to coding it again: code_luma4/8 are deterministic and write the same fields).
-            let mut c4 = c.clone();
-            let cbp4 = self.code_luma4(&src.y, py, qp, Deadzone::INTER, self.f.p.decimate, &mut c4);
-            let mut c8 = c.clone();
-            let cbp8 = self.code_luma8(&src.y, py, qp, Deadzone::INTER, self.f.p.decimate, &mut c8);
+            // Compare 4x4 and 8x8 transform by SSD + lambda * (approximate) bits, and keep the winner.
+            let (cbp4, o4) = self.code_luma4(&src.y, py, qp, Deadzone::INTER, dec);
+            let (cbp8, o8) = self.code_luma8(&src.y, py, qp, Deadzone::INTER, dec);
             let lam = self.f.lam.ssd[qp as usize];
-            let cost = |cc: &Cand, cbp: u8, eight: bool| {
-                let d = ssd(&src.y, 16, &cc.ry, 16, 16, 16) as f64;
-                let mut bits = 0f64;
-                if eight {
-                    for b in 0..4 {
-                        if (cbp >> b) & 1 != 0 {
-                            bits += cc.code.luma8[b].iter().map(|&v| level_bits(v)).sum::<f64>();
-                        }
-                    }
-                } else {
-                    for b in 0..16 {
-                        if (cbp >> (b / 4)) & 1 != 0 {
-                            bits += 1.0 + cc.code.luma4[b].iter().map(|&v| level_bits(v)).sum::<f64>();
-                        }
-                    }
+            let mut bits8 = 0f64;
+            for b in 0..4 {
+                if (cbp8 >> b) & 1 != 0 {
+                    bits8 += o8.lv[b].iter().map(|&v| level_bits(v)).sum::<f64>();
                 }
-                d + lam * bits
-            };
-            if cost(&c8, cbp8, true) <= cost(&c4, cbp4, false) {
-                *c = c8;
+            }
+            let mut bits4 = 0f64;
+            for b in 0..16 {
+                if (cbp4 >> (b / 4)) & 1 != 0 {
+                    bits4 += 1.0 + o4.lv[b].iter().map(|&v| level_bits(v)).sum::<f64>();
+                }
+            }
+            let cost8 = ssd(&src.y, 16, &o8.ry, 16, 16, 16) as f64 + lam * bits8;
+            let cost4 = ssd(&src.y, 16, &o4.ry, 16, 16, 16) as f64 + lam * bits4;
+            if cost8 <= cost4 {
+                o8.store8(c);
                 (true, cbp8)
             } else {
-                *c = c4;
+                o4.store4(c);
                 (false, cbp4)
             }
         } else if t8_allowed {
-            (true, self.code_luma8(&src.y, py, qp, Deadzone::INTER, self.f.p.decimate, c))
+            let (cbp, o) = self.code_luma8(&src.y, py, qp, Deadzone::INTER, dec);
+            o.store8(c);
+            (true, cbp)
         } else {
-            (false, self.code_luma4(&src.y, py, qp, Deadzone::INTER, self.f.p.decimate, c))
+            let (cbp, o) = self.code_luma4(&src.y, py, qp, Deadzone::INTER, dec);
+            o.store4(c);
+            (false, cbp)
         };
         c.code.t8x8 = use8 && cbpl != 0;
         c.info.t8x8 = c.code.t8x8;
@@ -1323,9 +1353,21 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
         }
         // sub-pel refinement with SATD
         let mut buf = [0u8; 256];
-        let scost = |mv: Mv, buf: &mut [u8; 256]| -> u32 {
+        // the refinement rounds revisit points (a round centred one step away repeats up to 5 of its 8),
+        // so costs are memoised; the cost of a vector is a pure function, so decisions are unchanged
+        let mut seen = [(Mv::ZERO, 0u32); 48];
+        let mut nseen = 0usize;
+        let mut scost = |mv: Mv, buf: &mut [u8; 256]| -> u32 {
+            if let Some(&(_, k)) = seen[..nseen].iter().find(|e| e.0 == mv) {
+                return k;
+            }
             r.mc_luma(bx, by, mv, w, h, buf, 16);
-            satd(src, sstride, buf, 16, w, h) + ((lam * mv_bits(mv, mvp)) >> 8)
+            let k = satd(src, sstride, buf, 16, w, h) + ((lam * mv_bits(mv, mvp)) >> 8);
+            if let Some(e) = seen.get_mut(nseen) {
+                *e = (mv, k);
+                nseen += 1;
+            }
+            k
         };
         let mut bs = scost(best, &mut buf);
         if p.subpel >= 1 {

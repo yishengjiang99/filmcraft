@@ -189,6 +189,48 @@ const QPEL_SRC: [[(u8, u8, u8); 2]; 16] = [
     [(2, 1, 0), (1, 0, 1)],
 ];
 
+/// Rows of a quarter-sample luma prediction: a copy of plane `a` from `ia`, or the rounded average of `a` and `b`
+/// (from `ib`), for `W`-wide rows. Same arithmetic as [`mc_rows_scalar`].
+#[inline(always)]
+fn mc_rows<const W: usize>(a: &[u8], ia: usize, b: Option<(&[u8], usize)>, stride: usize, h: usize, out: &mut [u8], ostride: usize) {
+    for r in 0..h {
+        let ra = a.get(ia + r * stride..).and_then(|x| x.first_chunk::<W>());
+        let o = out.get_mut(r * ostride..).and_then(|x| x.first_chunk_mut::<W>());
+        let (Some(ra), Some(o)) = (ra, o) else {
+            return mc_rows_scalar(a, ia, b, stride, W, h, out, ostride);
+        };
+        match b {
+            None => *o = *ra,
+            Some((b, ib)) => {
+                let Some(rb) = b.get(ib + r * stride..).and_then(|x| x.first_chunk::<W>()) else {
+                    return mc_rows_scalar(a, ia, Some((b, ib)), stride, W, h, out, ostride);
+                };
+                for i in 0..W {
+                    o[i] = ((ra[i] as u16 + rb[i] as u16 + 1) >> 1) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// Scalar reference of [`mc_rows`] for any width.
+#[allow(clippy::too_many_arguments)]
+fn mc_rows_scalar(a: &[u8], ia: usize, b: Option<(&[u8], usize)>, stride: usize, w: usize, h: usize, out: &mut [u8], ostride: usize) {
+    for r in 0..h {
+        let ra = &a[ia + r * stride..ia + r * stride + w];
+        let o = &mut out[r * ostride..r * ostride + w];
+        match b {
+            None => o.copy_from_slice(ra),
+            Some((b, ib)) => {
+                let rb = &b[ib + r * stride..ib + r * stride + w];
+                for i in 0..w {
+                    o[i] = ((ra[i] as u16 + rb[i] as u16 + 1) >> 1) as u8;
+                }
+            }
+        }
+    }
+}
+
 impl RefPic {
     #[inline]
     fn plane(&self, p: u8) -> &Plane {
@@ -207,21 +249,14 @@ impl RefPic {
         let a = self.plane(pa);
         let stride = a.stride;
         let ia = a.idx(xi + dxa as isize, yi + dya as isize);
-        if pa == pb && dxa == dxb && dya == dyb {
-            for r in 0..h {
-                out[r * ostride..r * ostride + w].copy_from_slice(&a.data[ia + r * stride..ia + r * stride + w]);
-            }
-        } else {
-            let b = self.plane(pb);
-            let ib = b.idx(xi + dxb as isize, yi + dyb as isize);
-            for r in 0..h {
-                let ra = &a.data[ia + r * stride..ia + r * stride + w];
-                let rb = &b.data[ib + r * stride..ib + r * stride + w];
-                let o = &mut out[r * ostride..r * ostride + w];
-                for i in 0..w {
-                    o[i] = ((ra[i] as u16 + rb[i] as u16 + 1) >> 1) as u8;
-                }
-            }
+        let b = self.plane(pb);
+        let ib = if pa == pb && dxa == dxb && dya == dyb { None } else { Some(b.idx(xi + dxb as isize, yi + dyb as isize)) };
+        // fixed-width rows for the common widths: inlined copies and a vectorised rounding average
+        match w {
+            16 => mc_rows::<16>(&a.data, ia, ib.map(|i| (&b.data[..], i)), stride, h, out, ostride),
+            8 => mc_rows::<8>(&a.data, ia, ib.map(|i| (&b.data[..], i)), stride, h, out, ostride),
+            4 => mc_rows::<4>(&a.data, ia, ib.map(|i| (&b.data[..], i)), stride, h, out, ostride),
+            _ => mc_rows_scalar(&a.data, ia, ib.map(|i| (&b.data[..], i)), stride, w, h, out, ostride),
         }
     }
 

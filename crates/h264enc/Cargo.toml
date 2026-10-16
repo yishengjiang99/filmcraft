@@ -17,6 +17,8 @@ threads = ["dep:rayon"]
 filmcraft-bitstream = { workspace = true }
 thiserror = { workspace = true }
 rayon = { workspace = true, optional = true }
+# safe portable 128-bit SIMD (wasm simd128 / NEON / SSE2) for the residual and distortion kernels
+wide = { workspace = true }
 
 [dev-dependencies]
 filmcraft-testkit = { workspace = true }
