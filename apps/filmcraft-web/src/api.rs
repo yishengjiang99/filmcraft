@@ -154,6 +154,13 @@ pub fn install() -> Result<(), JsValue> {
             let mut v = crate::info();
             v["webcodecsStats"] = crate::webcodecs::stats();
             v["fetchesInFlight"] = json!(crate::fs::inflight());
+            // the wasm heap (linear memory) size: it only grows, so peak = latest
+            let wasm_bytes = wasm_bindgen::memory()
+                .dyn_into::<js_sys::WebAssembly::Memory>()
+                .ok()
+                .and_then(|m| js_sys::Reflect::get(&m.buffer(), &"byteLength".into()).ok())
+                .and_then(|n| n.as_f64());
+            v["memory"] = json!({ "wasmBytes": wasm_bytes });
             to_js(&v)
         })
         .into_js_value(),
