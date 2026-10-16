@@ -1,6 +1,8 @@
 //! Golden output hashes: speed work (the lane-parallel kernels, removed recomputation) must not change a
 //! single output byte. The hashes were recorded with the scalar encoder before those changes; a change
 //! that is meant to alter the output has to update them deliberately (and say why in the commit).
+//! Every configuration sets the slice count (the default follows the core count), so the hashes are the
+//! same on every machine and also for the single-threaded wasm build.
 
 mod common;
 
@@ -53,6 +55,7 @@ fn encoder_output_is_unchanged() {
             c.preset = Preset::Speed;
             c.bframes = 0;
             c.rate = RateControl::Crf(23.0);
+            c.slices = 1;
         }),
         encode(320, 240, 8, |c| {
             c.preset = Preset::Quality;
@@ -63,18 +66,21 @@ fn encoder_output_is_unchanged() {
         encode(320, 240, 8, |c| {
             c.profile = Profile::Baseline;
             c.rate = RateControl::Cbr { kbps: 1500 };
+            c.slices = 3;
         }),
         // odd size (cropping, partial macroblocks), low and high QP
         encode(162, 98, 6, |c| {
             c.bframes = 1;
             c.rate = RateControl::Qp(10);
+            c.slices = 1;
         }),
         encode(162, 98, 6, |c| {
             c.preset = Preset::Quality;
             c.rate = RateControl::Qp(45);
+            c.slices = 2;
         }),
     ];
-    let want: [u64; 6] = [0xd913d97463c31940, 0x71279a5a10664008, 0xdfe5bf6c7edb4705, 0x5c352281c8b4952f, 0x2ee16937ffe11c6b, 0xa4756f33b291b4ae];
+    let want: [u64; 6] = [0xd913d97463c31940, 0x05f72d9ab8a8ba25, 0xdfe5bf6c7edb4705, 0xfbb330f16d2efd56, 0xe8c4dad51d2578e5, 0xa4756f33b291b4ae];
     for (i, g) in got.iter().enumerate() {
         println!("config {i}: {g:#018x}");
     }
