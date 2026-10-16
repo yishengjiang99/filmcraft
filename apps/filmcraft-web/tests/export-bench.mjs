@@ -14,7 +14,7 @@
 // output is fetched from the download directory. Warmup runs are discarded; medians and MADs
 // of the measured runs go to <out>/results.jsonl (one line per configuration).
 import { execSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statfsSync, writeFileSync } from "node:fs";
 import { cpus, platform, release } from "node:os";
 import { join, resolve } from "node:path";
 import { arg, attach, flag, launch, sleep } from "./cdp.mjs";
@@ -110,10 +110,21 @@ async function clearOrigin(page) {
   await page.js(`(async () => { const root = await navigator.storage.getDirectory(); for await (const [n] of root.entries()) await root.removeEntry(n, { recursive: true }); return true; })()`);
 }
 
+// the tab of the run in progress, closed if the harness is interrupted (a left-over tab keeps
+// exporting and distorts every later run)
+let livePage = null;
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, async () => {
+    if (livePage) await Promise.race([livePage.close(), sleep(2000)]);
+    process.exit(130);
+  });
+}
+
 async function oneRun(browser, project, runDir, i) {
   const downloads = join(runDir, "downloads");
   mkdirSync(downloads, { recursive: true });
   const page = await browser.newPage("about:blank");
+  livePage = page;
   const r = { run: i };
   try {
     await page.send("Page.addScriptToEvaluateOnNewDocument", { source: PAGE_PROBE });
@@ -251,6 +262,8 @@ async function oneRun(browser, project, runDir, i) {
       loaf: { count: pb.loaf.length, over50: pb.loaf.filter((l) => l.d > 50).length, max: pb.loaf.length ? Math.max(...pb.loaf.map((l) => l.d)) : 0, blockingMs: pb.loaf.reduce((s, l) => s + l.b, 0) },
       longtasks: { count: pb.longtasks.length, max: pb.longtasks.length ? Math.max(...pb.longtasks) : 0, tbtMs: pb.longtasks.reduce((s, d) => s + Math.max(0, d - 50), 0) },
       perfStatsUi: perf?.ui ?? null,
+      // where the memory goes: decoded-frame cache, plane pool, frame-server caches, WebCodecs sources
+      memoryDetail: perf ? { decode: { cacheMB: perf.decode?.cacheMB, cacheBudgetMB: perf.decode?.cacheBudgetMB, planePoolMB: perf.decode?.planePoolMB, liveDecoders: perf.decode?.liveDecoders }, frames: perf.frames?.cache ?? null, webcodecs: infoAfter.webcodecsStats?.transfers ?? null } : null,
       memory: {
         wasmStart: wasm[0] ?? null, wasmPeak: wasm.length ? Math.max(...wasm) : null, wasmGrowth: wasm.length ? Math.max(...wasm) - wasm[0] : null,
         jsHeapPeak: js.length ? Math.max(...js) : null, uaBefore: uaMemBefore, uaAfter: uaMemAfter,
@@ -281,6 +294,7 @@ async function oneRun(browser, project, runDir, i) {
   r.fatal = page.fatalLogs();
   r.consoleTail = page.logs.slice(-20);
   await page.close();
+  livePage = null;
   return r;
 }
 
@@ -302,6 +316,13 @@ function aggregate(runs) {
 
 // ---- main
 mkdirSync(opts.out, { recursive: true });
+// Chrome keeps fetched media and downloads on disk: a nearly full disk makes imports fail with
+// "Failed to fetch"
+try {
+  const st = statfsSync(opts.out);
+  const freeGiB = (st.bavail * st.bsize) / 2 ** 30;
+  if (freeGiB < 5) console.error(`WARNING: only ${freeGiB.toFixed(1)} GiB free on the output disk: imports and downloads may fail`);
+} catch {}
 const browser = opts.launch ? await launch({ headless: true }) : await attach(opts.attach);
 const env = existsSync(join(opts.out, "env.json")) ? JSON.parse(readFileSync(join(opts.out, "env.json"), "utf8")) : null;
 const chromeVersion = browser.version.Browser;

@@ -20,8 +20,9 @@ const extra = arg("extra", "");
 const env = existsSync(`${out}/env.json`) ? JSON.parse(readFileSync(`${out}/env.json`, "utf8")) : null;
 
 const MATRICES = {
-  // the per-iteration loop (§3): P2 × H.264 × {software, hardware}
-  quick: ["P2:h264:software:auto:auto:mt", "P2:h264:hardware:auto:auto:mt"],
+  // the per-iteration loop (§3) on the short projects: P2s × H.264 × {software, hardware}
+  quick: ["P2s:h264:software:cpu:auto:mt", "P2s:h264:hardware:cpu:auto:mt"],
+  short: ["P1s", "P2s", "P3s"].flatMap((p) => [`${p}:h264:software:cpu:auto:mt`, `${p}:h264:hardware:cpu:auto:mt`]),
   full: [
     ...["P1", "P2", "P3"].flatMap((p) => ["software", "hardware"].flatMap((e) => ["cpu", "gpu"].map((c) => `${p}:h264:${e}:${c}:auto:mt`))),
     ...["P1", "P2", "P3"].map((p) => `${p}:hevc:hardware:gpu:auto:mt`),
