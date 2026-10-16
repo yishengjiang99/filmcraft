@@ -11,7 +11,7 @@
 //! (which stay the reference), so results are bit-identical; the tests below check that on random and
 //! extreme blocks.
 
-use wide::i32x4;
+use wide::{i8x16, i16x8, i32x4, i32x8, u8x16};
 
 use crate::transform::{Deadzone, QuantTables};
 #[cfg(test)]
@@ -22,39 +22,68 @@ pub type Lanes4<const L: usize> = [[i32; L]; 16];
 /// `L` blocks of 64 coefficients, `[pos][lane]`.
 pub type Lanes8<const L: usize> = [[i32; L]; 64];
 
-/// `src - pred` of one 16-sample row as four vectors.
+/// 4x4 byte transpose `out[4i + j] = in[4j + i]` (its own inverse): turns four 4-sample groups (one per
+/// block) into four groups of one sample per block.
+const T4: [i8; 16] = [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
+
+/// The byte permutation `T4` as a single swizzle (`i8x16.swizzle` / `tbl`).
 #[inline(always)]
-fn diff16(s: &[u8; 16], p: &[u8; 16]) -> [i32x4; 4] {
-    let d = |k: usize| i32x4::new([0, 1, 2, 3].map(|i| s[4 * k + i] as i32 - p[4 * k + i] as i32));
-    [d(0), d(1), d(2), d(3)]
+fn t4(v: [u8; 16]) -> u8x16 {
+    let x = i8x16::new(v.map(|b| b as i8)).swizzle(i8x16::new(T4));
+    u8x16::new(x.to_array().map(|b| b as u8))
 }
 
-/// `src - pred` of one 8-sample row as two vectors.
+/// `src - pred` of 16 samples, as four `i32x4` (samples 0..4, 4..8, 8..12, 12..16).
 #[inline(always)]
-fn diff8(s: &[u8; 8], p: &[u8; 8]) -> [i32x4; 2] {
-    let d = |k: usize| i32x4::new([0, 1, 2, 3].map(|i| s[4 * k + i] as i32 - p[4 * k + i] as i32));
-    [d(0), d(1)]
+fn diff16(s: u8x16, p: u8x16) -> [i32x4; 4] {
+    let lo = i16x8::from_u8x16_low(s) - i16x8::from_u8x16_low(p);
+    let hi = i16x8::from_u8x16_high(s) - i16x8::from_u8x16_high(p);
+    let (l, h) = (i32x8::from_i16x8(lo).to_array(), i32x8::from_i16x8(hi).to_array());
+    [i32x4::new([l[0], l[1], l[2], l[3]]), i32x4::new([l[4], l[5], l[6], l[7]]), i32x4::new([h[0], h[1], h[2], h[3]]), i32x4::new([h[4], h[5], h[6], h[7]])]
 }
 
-/// `clip(pred + r)` of one row of `4 * N` samples.
+/// `clip(pred + r)` of 16 samples: `r` saturated to `i16` (clipping makes that exact), added with saturation
+/// and narrowed with unsigned saturation, which is the clip to 0..=255.
 #[inline(always)]
-fn add_clip<const N: usize, const W: usize>(p: &[u8; W], r: [i32x4; N], out: &mut [u8; W]) {
-    let r: [i32; W] = std::array::from_fn(|i| r[i / 4].as_array_ref()[i % 4]);
-    for i in 0..W {
-        out[i] = (p[i] as i32 + r[i]).clamp(0, 255) as u8;
+fn add_clip16(p: u8x16, r: [i32x4; 4]) -> u8x16 {
+    let a = |x: i32x4, y: i32x4| {
+        let (x, y) = (x.to_array(), y.to_array());
+        i16x8::from_i32x8_saturate(i32x8::new([x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3]]))
+    };
+    let lo = i16x8::from_u8x16_low(p).saturating_add(a(r[0], r[1]));
+    let hi = i16x8::from_u8x16_high(p).saturating_add(a(r[2], r[3]));
+    u8x16::narrow_i16x8(lo, hi)
+}
+
+/// Two 8-sample rows as one 16-byte vector.
+#[inline(always)]
+fn join8(a: &[u8; 8], b: &[u8; 8]) -> [u8; 16] {
+    let mut v = [0u8; 16];
+    v[..8].copy_from_slice(a);
+    v[8..].copy_from_slice(b);
+    v
+}
+
+/// Four 4-sample groups as one 16-byte vector.
+#[inline(always)]
+fn join4(a: &[u8], b: &[u8], c: &[u8], d: &[u8]) -> [u8; 16] {
+    let mut v = [0u8; 16];
+    for (k, x) in [a, b, c, d].into_iter().enumerate() {
+        v[4 * k..4 * k + 4].copy_from_slice(&x[..4]);
     }
+    v
 }
 
 /// Residual `src - pred` of the sixteen 4x4 blocks of a 16x16 block (stride 16); lane = `by * 4 + bx`.
-/// Each row's four 4-sample groups are transposed into the four lanes of one block row.
+/// A row's bytes are transposed (`T4`) so that each group of four holds one sample of each block.
 #[inline]
 pub fn residual4_16x16(src: &[u8; 256], pred: &[u8; 256]) -> Lanes4<16> {
     let (s, p) = (src.as_chunks::<16>().0, pred.as_chunks::<16>().0);
     let mut d = [[0i32; 16]; 16];
     for (y, (s, p)) in s.iter().zip(p).enumerate() {
-        let t = i32x4::transpose(diff16(s, p));
+        let v = diff16(t4(*s), t4(*p));
         for xx in 0..4 {
-            store(&mut d[(y & 3) * 4 + xx], (y >> 2) * 4, t[xx]);
+            store(&mut d[(y & 3) * 4 + xx], (y >> 2) * 4, v[xx]);
         }
     }
     d
@@ -67,10 +96,10 @@ pub fn residual4_2x8x8(src: [&[u8; 64]; 2], pred: [&[u8; 64]; 2]) -> Lanes4<8> {
     for comp in 0..2 {
         let (s, p) = (src[comp].as_chunks::<8>().0, pred[comp].as_chunks::<8>().0);
         for yy in 0..4 {
-            let (r0, r1) = (diff8(&s[yy], &p[yy]), diff8(&s[yy + 4], &p[yy + 4]));
-            let t = i32x4::transpose([r0[0], r0[1], r1[0], r1[1]]);
+            // rows yy and yy + 4 side by side: the groups of four are blocks (0,0) (1,0) (0,1) (1,1)
+            let v = diff16(t4(join8(&s[yy], &s[yy + 4])), t4(join8(&p[yy], &p[yy + 4])));
             for xx in 0..4 {
-                store(&mut d[yy * 4 + xx], comp * 4, t[xx]);
+                store(&mut d[yy * 4 + xx], comp * 4, v[xx]);
             }
         }
     }
@@ -83,12 +112,16 @@ pub fn residual8_16x16(src: &[u8; 256], pred: &[u8; 256]) -> Lanes8<4> {
     let (s, p) = (src.as_chunks::<16>().0, pred.as_chunks::<16>().0);
     let mut d = [[0i32; 4]; 64];
     for yy in 0..8 {
-        let (a, b) = (diff16(&s[yy], &p[yy]), diff16(&s[yy + 8], &p[yy + 8]));
-        let t = i32x4::transpose([a[0], a[2], b[0], b[2]]);
-        let u = i32x4::transpose([a[1], a[3], b[1], b[3]]);
-        for xx in 0..4 {
-            d[yy * 8 + xx] = t[xx].to_array();
-            d[yy * 8 + 4 + xx] = u[xx].to_array();
+        let (sa, sb, pa, pb) = (&s[yy], &s[yy + 8], &p[yy], &p[yy + 8]);
+        // columns 0..4 (then 4..8) of the four blocks: rows yy of the top blocks and yy + 8 of the bottom ones
+        for half in 0..2 {
+            let o = half * 4;
+            let js = join4(&sa[o..], &sa[8 + o..], &sb[o..], &sb[8 + o..]);
+            let jp = join4(&pa[o..], &pa[8 + o..], &pb[o..], &pb[8 + o..]);
+            let v = diff16(t4(js), t4(jp));
+            for xx in 0..4 {
+                d[yy * 8 + o + xx] = v[xx].to_array();
+            }
         }
     }
     d
@@ -318,21 +351,26 @@ pub fn quant4_lanes<const L: usize>(c: &mut Lanes4<L>, qt: &QuantTables, qp: u8,
     }
 }
 
-/// [`crate::transform::quant8`] of every lane (without the non-zero count), with the same 64-bit products:
-/// `|v| < 2^21` and `mf < 2^16`, so the signed widening multiply of the non-negative operands is exact.
+/// [`crate::transform::quant8`] of every lane (without the non-zero count), in exact 32-bit arithmetic.
+///
+/// The scalar code computes `(|v|·mf + f) >> qbits` in `i64` (`qbits = 22 + qp/6`). Here `|v| = a1·2^11 + a0`:
+/// with `x = a0·mf + f` and `y = a1·mf + (x >> 11)`, `(|v|·mf + f) >> qbits = y >> (qbits - 11)` exactly (the
+/// dropped low 11 bits of `x` cannot carry past bit `qbits`). Bounds: an 8x8 coefficient of an 8-bit residual is
+/// below 2^20, `mf < 2^16`, `f < 2^29`, so `x < 2^30` and `y < 2^26`.
 #[inline]
 pub fn quant8_lanes<const L: usize>(c: &mut Lanes8<L>, qt: &QuantTables, qp: u8, dz: Deadzone) {
     let qbits = 22 + (qp / 6) as u32;
-    let f = ((1i64 << qbits) * dz.f256) >> 8;
+    let f = i32x4::splat((((1i64 << qbits) * dz.f256) >> 8) as i32);
     let mf = &qt.mf8[(qp % 6) as usize];
+    let low = i32x4::splat(0x7ff);
     for k in 0..64 {
-        let m = i32x4::splat(mf[k].clamp(0, i32::MAX as i64) as i32);
+        let m = i32x4::splat(mf[k] as i32);
         for l in (0..L).step_by(4) {
             let v = load(&c[k], l);
-            let p = (v.abs().mul_widen(m) + f) >> qbits;
-            let p = p.to_array();
-            let a = i32x4::new([p[0] as i32, p[1] as i32, p[2] as i32, p[3] as i32]);
-            store(&mut c[k], l, apply_sign(a, v));
+            let a = v.abs();
+            let x = (a & low) * m + f;
+            let y = (a >> 11) * m + (x >> 11);
+            store(&mut c[k], l, apply_sign(y >> (qbits - 11), v));
         }
     }
 }
@@ -366,13 +404,36 @@ pub fn dequant8_lanes<const L: usize>(c: &mut Lanes8<L>, qt: &QuantTables, qp: u
     }
 }
 
+/// Which lanes (blocks) have a non-zero value in rows `from..`.
+#[inline]
+pub fn nonzero_lanes_from<const L: usize, const P: usize>(c: &[[i32; L]; P], from: usize) -> [bool; L] {
+    let mut out = [false; L];
+    for l in (0..L).step_by(4) {
+        let mut acc = i32x4::ZERO;
+        for row in c.iter().skip(from) {
+            acc |= load(row, l);
+        }
+        let a = acc.to_array();
+        for i in 0..4 {
+            out[l + i] = a[i] != 0;
+        }
+    }
+    out
+}
+
+/// Which lanes (blocks) have a non-zero value.
+#[inline]
+pub fn nonzero_lanes<const L: usize, const P: usize>(c: &[[i32; L]; P]) -> [bool; L] {
+    nonzero_lanes_from(c, 0)
+}
+
 /// Reconstruction `clip(pred + r)` of a 16x16 block from the residual lanes of [`residual4_16x16`].
 #[inline]
 pub fn recon4_16x16(pred: &[u8; 256], r: &Lanes4<16>, out: &mut [u8; 256]) {
     let p = pred.as_chunks::<16>().0;
     for (y, o) in out.as_chunks_mut::<16>().0.iter_mut().enumerate() {
-        let a = i32x4::transpose(std::array::from_fn(|xx| load(&r[(y & 3) * 4 + xx], (y >> 2) * 4)));
-        add_clip(&p[y], a, o);
+        let v = std::array::from_fn(|xx| load(&r[(y & 3) * 4 + xx], (y >> 2) * 4));
+        *o = t4(add_clip16(t4(p[y]), v).to_array()).to_array();
     }
 }
 
@@ -382,10 +443,21 @@ pub fn recon8_16x16(pred: &[u8; 256], r: &Lanes8<4>, out: &mut [u8; 256]) {
     let p = pred.as_chunks::<16>().0;
     let o = out.as_chunks_mut::<16>().0;
     for yy in 0..8 {
-        let t = i32x4::transpose(std::array::from_fn(|xx| i32x4::new(r[yy * 8 + xx])));
-        let u = i32x4::transpose(std::array::from_fn(|xx| i32x4::new(r[yy * 8 + 4 + xx])));
-        add_clip(&p[yy], [t[0], u[0], t[1], u[1]], &mut o[yy]);
-        add_clip(&p[yy + 8], [t[2], u[2], t[3], u[3]], &mut o[yy + 8]);
+        let (pa, pb) = (p[yy], p[yy + 8]);
+        let mut ra = [0u8; 16];
+        let mut rb = [0u8; 16];
+        for half in 0..2 {
+            let h = half * 4;
+            let jp = join4(&pa[h..], &pa[8 + h..], &pb[h..], &pb[8 + h..]);
+            let v = std::array::from_fn(|xx| i32x4::new(r[yy * 8 + h + xx]));
+            let x = t4(add_clip16(t4(jp), v).to_array()).to_array();
+            ra[h..h + 4].copy_from_slice(&x[..4]);
+            ra[8 + h..12 + h].copy_from_slice(&x[4..8]);
+            rb[h..h + 4].copy_from_slice(&x[8..12]);
+            rb[8 + h..12 + h].copy_from_slice(&x[12..]);
+        }
+        o[yy] = ra;
+        o[yy + 8] = rb;
     }
 }
 
@@ -395,9 +467,10 @@ pub fn recon4_8x8(pred: &[u8; 64], r: &Lanes4<8>, comp: usize, out: &mut [u8; 64
     let p = pred.as_chunks::<8>().0;
     let o = out.as_chunks_mut::<8>().0;
     for yy in 0..4 {
-        let a = i32x4::transpose(std::array::from_fn(|xx| load(&r[yy * 4 + xx], comp * 4)));
-        add_clip(&p[yy], [a[0], a[1]], &mut o[yy]);
-        add_clip(&p[yy + 4], [a[2], a[3]], &mut o[yy + 4]);
+        let v = std::array::from_fn(|xx| load(&r[yy * 4 + xx], comp * 4));
+        let x = t4(add_clip16(t4(join8(&p[yy], &p[yy + 4])), v).to_array()).to_array();
+        o[yy].copy_from_slice(&x[..8]);
+        o[yy + 4].copy_from_slice(&x[8..]);
     }
 }
 
@@ -665,6 +738,20 @@ mod tests {
                 assert_eq!(x, y, "case {n} comp {comp}");
             }
         }
+    }
+
+    #[test]
+    fn nonzero_lanes_finds_every_lane() {
+        for l in 0..16 {
+            for row in [0, 1, 7, 15] {
+                let mut c = [[0i32; 16]; 16];
+                c[row][l] = if row % 2 == 0 { -1 } else { i32::MIN };
+                let nz = nonzero_lanes(&c);
+                assert!((0..16).all(|i| nz[i] == (i == l)), "lane {l} row {row}");
+                assert_eq!(nonzero_lanes_from(&c, 1)[l], row >= 1);
+            }
+        }
+        assert_eq!(nonzero_lanes(&[[0i32; 4]; 64]), [false; 4]);
     }
 
     /// The transforms on arbitrary (not only residual-derived) coefficients, including the largest

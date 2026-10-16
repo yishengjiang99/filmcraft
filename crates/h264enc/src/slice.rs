@@ -605,11 +605,16 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
                 *v = (*v).clamp(-cavlc::MAX_LEVEL, cavlc::MAX_LEVEL);
             }
         }
+        let nzl = kernels::nonzero_lanes_from(&co, 1);
         let mut dcl = [[0i32; 4]; 2];
         for comp in 0..2 {
             let mut ac_score = 0;
             for b in 0..4 {
                 let l = comp * 4 + b;
+                if !nzl[l] {
+                    c.code.cac[l] = [0; 16];
+                    continue; // no AC levels, decimation score 0
+                }
                 let mut scan = [0i16; 16];
                 for k in 1..16 {
                     scan[k] = co[ZIGZAG4[k]][l] as i16;
@@ -663,10 +668,16 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
                 co[0][l] = dcq[b];
             }
         }
-        // a DC-only block's inverse transform is the flat (dc + 32) >> 6 the scalar path used
-        let r = kernels::idct4_lanes(&co);
-        kernels::recon4_8x8(pu, &r, 0, &mut c.ru);
-        kernels::recon4_8x8(pv, &r, 1, &mut c.rv);
+        // a DC-only block's inverse transform is the flat (dc + 32) >> 6 the scalar path used; with no levels
+        // at all every coefficient is 0 and the reconstruction is the prediction
+        if cbp == 0 {
+            c.ru = *pu;
+            c.rv = *pv;
+        } else {
+            let r = kernels::idct4_lanes(&co);
+            kernels::recon4_8x8(pu, &r, 0, &mut c.ru);
+            kernels::recon4_8x8(pv, &r, 1, &mut c.rv);
+        }
         if cbp == 0 {
             c.code.cdc = [[0; 4]; 2];
         }
@@ -688,10 +699,14 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
                 *v = (*v).clamp(-cavlc::MAX_LEVEL, cavlc::MAX_LEVEL);
             }
         }
+        let nz = kernels::nonzero_lanes(&co);
         let mut score8 = [0u32; 4];
         for blk in 0..16 {
             let (bx, by) = BLK4_XY[blk];
             let l = by * 4 + bx;
+            if !nz[l] {
+                continue; // levels stay zero, decimation score 0
+            }
             let mut scan = [0i16; 16];
             for k in 0..16 {
                 scan[k] = co[ZIGZAG4[k]][l] as i16;
@@ -722,8 +737,12 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             o.nnz[by * 4 + bx] = o.lv[blk].iter().filter(|&&v| v != 0).count() as u8;
         }
         // an all-zero block reconstructs to the prediction (its inverse transform is exactly 0)
-        kernels::dequant4_lanes(&mut co, qt, qp, false);
-        kernels::recon4_16x16(pred, &kernels::idct4_lanes(&co), &mut o.ry);
+        if cbp == 0 {
+            o.ry = *pred;
+        } else {
+            kernels::dequant4_lanes(&mut co, qt, qp, false);
+            kernels::recon4_16x16(pred, &kernels::idct4_lanes(&co), &mut o.ry);
+        }
         (cbp, o)
     }
 
@@ -734,8 +753,12 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
         // all four 8x8 blocks at once, lane = by * 2 + bx (see `kernels`)
         let mut co = kernels::fdct8_lanes(&kernels::residual8_16x16(src, pred));
         kernels::quant8_lanes(&mut co, qt, qp, dz);
+        let nzl = kernels::nonzero_lanes(&co);
         let mut score = [0u32; 4];
         for b8 in 0..4 {
+            if !nzl[b8] {
+                continue; // levels stay zero, decimation score 0
+            }
             let mut scan = [0i16; 64];
             for k in 0..64 {
                 scan[k] = co[ZIGZAG8[k]][b8] as i16;
@@ -762,8 +785,12 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             }
         }
         // an all-zero block reconstructs to the prediction (its inverse transform is exactly 0)
-        kernels::dequant8_lanes(&mut co, qt, qp);
-        kernels::recon8_16x16(pred, &kernels::idct8_lanes(&co), &mut o.ry);
+        if cbp == 0 {
+            o.ry = *pred;
+        } else {
+            kernels::dequant8_lanes(&mut co, qt, qp);
+            kernels::recon8_16x16(pred, &kernels::idct8_lanes(&co), &mut o.ry);
+        }
         (cbp, o)
     }
 
