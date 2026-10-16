@@ -58,7 +58,9 @@ async fn file_handle(rel: &str, create: bool) -> Result<FileSystemFileHandle, Js
 async fn write_now(rel: &str, data: &[u8]) -> Result<(), JsValue> {
     let fh = file_handle(rel, true).await?;
     let w: web_sys::FileSystemWritableFileStream = JsFuture::from(fh.create_writable()).await?.dyn_into()?;
-    JsFuture::from(w.write_with_u8_array(data)?).await?;
+    // A copy into a fresh JS buffer, not a view of wasm memory: in the threaded build that memory
+    // is a SharedArrayBuffer, which `write` rejects ("must not be shared").
+    JsFuture::from(w.write_with_js_u8_array(&js_sys::Uint8Array::from(data))?).await?;
     JsFuture::from(w.close()).await?;
     Ok(())
 }

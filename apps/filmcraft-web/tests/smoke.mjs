@@ -213,7 +213,9 @@ try {
   if (!report.steps.importCollision.ok) throw new Error("import collision regression: " + JSON.stringify(report.steps.importCollision.gates));
   // still alive? (a panicked app never answers)
   await Promise.race([js("filmcraft.inspect().then(() => true)"), sleep(5000).then(() => { throw new Error("app stopped answering"); })]);
-  const fatal = logs.filter((l) => /panicked at|RuntimeError|EXCEPTION/.test(l));
+  // failed OPFS writes mean recovery snapshots are lost (the threaded build once passed views of
+  // its shared memory, which `FileSystemWritableFileStream.write` rejects)
+  const fatal = logs.filter((l) => /panicked at|RuntimeError|EXCEPTION|OPFS write/.test(l));
   if (fatal.length) throw new Error("panic / uncaught exception:\n" + fatal.join("\n").slice(0, 4000));
   if (await js("window.filmcraftLoad.fatal || null")) throw new Error("fatal overlay shown");
   report.ok = true;
