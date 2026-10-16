@@ -16,7 +16,9 @@
 //!   lists, against a reference list (default: the local `plan/premiere/<area>.json`), presence and
 //!   placement reported separately (`parity.rs`, docs/gaps.md G7).
 //! - `ico <out.ico> <in.png>…`: pack PNGs into a Windows `.ico` (used by `packaging/icons.sh`).
-//! - `ci`: fmt check, clippy -D warnings, tests, layers, assets, wasm.
+//! - `ci [--full]`: fmt check, clippy -D warnings, tests, layers, assets, wasm. Tests run the fast
+//!   tier by default (`test_fast`: every test of the changed packages + the never-crash suite of the
+//!   rest, ~20% of the tests); `--full` runs the whole suite.
 
 mod ico;
 mod parity;
@@ -352,7 +354,20 @@ fn web(args: &[String]) -> Result<(), String> {
         // Through rustup: `env!("CARGO")` names the current toolchain's own cargo
         // binary, which does not understand a `+nightly` argument.
         let mut b = Command::new("rustup");
-        b.args(["run", "nightly", "cargo", "build", "-Z", "build-std=std,panic_abort", "--target", "wasm32-unknown-unknown", "-p", "filmcraft-web", "--profile", profile]);
+        b.args([
+            "run",
+            "nightly",
+            "cargo",
+            "build",
+            "-Z",
+            "build-std=std,panic_abort",
+            "--target",
+            "wasm32-unknown-unknown",
+            "-p",
+            "filmcraft-web",
+            "--profile",
+            profile,
+        ]);
         b.env("CARGO_TARGET_DIR", &mt_target);
         let mut flags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
         if !flags.is_empty() {
@@ -375,7 +390,15 @@ fn web(args: &[String]) -> Result<(), String> {
         if !dev && Command::new("wasm-opt").arg("--version").output().is_ok() {
             let opt = mt_dir.join("filmcraft_web_opt.wasm");
             run(Command::new("wasm-opt")
-                .args(["-O2", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-sign-ext", "--enable-mutable-globals", "--enable-simd", "--enable-threads"])
+                .args([
+                    "-O2",
+                    "--enable-bulk-memory",
+                    "--enable-nontrapping-float-to-int",
+                    "--enable-sign-ext",
+                    "--enable-mutable-globals",
+                    "--enable-simd",
+                    "--enable-threads",
+                ])
                 .arg(&mt_bg)
                 .arg("-o")
                 .arg(&opt))?;
@@ -514,14 +537,91 @@ fn fixtures(only: &[String]) -> Result<(), String> {
     if failed.is_empty() { Ok(()) } else { Err(format!("fixture generation failed in {}", failed.join(", "))) }
 }
 
-fn ci() -> Result<(), String> {
+fn ci(args: &[String]) -> Result<(), String> {
     let cargo = env!("CARGO");
     run(Command::new(cargo).args(["fmt", "--check"]))?;
     run(Command::new(cargo).args(["clippy", "--workspace", "--all-targets", "--release", "--", "-D", "warnings"]))?;
-    run(Command::new(cargo).args(["test", "--workspace", "--release"]))?;
+    if args.iter().any(|a| a == "--full") {
+        run(Command::new(cargo).args(["test", "--workspace", "--release"]))?;
+    } else {
+        test_fast()?;
+    }
     layers()?;
     assets()?;
     wasm()
+}
+
+/// Test-name fragments of the never-crash suite (AGENTS.md §0.8): crash regressions, hostile
+/// parameters, fuzz/mutation and malformed-input tests. The fast tier runs these in every crate.
+const SAFETY_TESTS: &[&str] =
+    &["panic", "crash", "hostile", "never_", "fuzz", "robust", "malformed", "truncat", "corrupt", "garbage", "overflow", "mutat", "bitflip"];
+
+/// Files outside any one crate whose change can affect every crate: run the whole suite.
+const GLOBAL_FILES: &[&str] = &["Cargo.toml", "Cargo.lock", "clippy.toml", "rustfmt.toml", "rust-toolchain.toml", ".cargo/"];
+
+/// The fast test tier of `cargo xtask ci` (`--full` runs everything): every test of the packages
+/// the working tree changes (vs HEAD, untracked files included), plus the never-crash suite of all
+/// the others — their unit tests matching `SAFETY_TESTS` and their integration-test files named
+/// after it (`robustness.rs`, `fuzz.rs`…). Other integration-test binaries of unchanged crates are
+/// not even built, which is most of the time a full run takes.
+fn test_fast() -> Result<(), String> {
+    let cargo = env!("CARGO");
+    let out = Command::new(cargo).args(["metadata", "--no-deps", "--format-version", "1"]).output().map_err(|e| format!("cargo metadata: {e}"))?;
+    let meta: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("cargo metadata: {e}"))?;
+    let root = meta["workspace_root"].as_str().unwrap_or(".").to_string();
+    let git = |args: &[&str]| -> Result<Vec<String>, String> {
+        let o = Command::new("git").args(args).current_dir(&root).output().map_err(|e| format!("git: {e}"))?;
+        Ok(String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
+    };
+    let mut changed = git(&["diff", "--name-only", "HEAD"])?;
+    changed.extend(git(&["ls-files", "--others", "--exclude-standard"])?);
+    if changed.iter().any(|f| GLOBAL_FILES.iter().any(|g| f == g || (g.ends_with('/') && f.starts_with(g)))) {
+        println!("ci: workspace-wide files changed: running the full test suite");
+        return run(Command::new(cargo).args(["test", "--workspace", "--release"]));
+    }
+    let safety = |name: &str| SAFETY_TESTS.iter().any(|k| name.contains(k));
+    // (package, its directory relative to the workspace root, integration-test targets)
+    let mut packages = Vec::new();
+    for p in meta["packages"].as_array().map(Vec::as_slice).unwrap_or_default() {
+        let (Some(name), Some(manifest)) = (p["name"].as_str(), p["manifest_path"].as_str()) else { continue };
+        let dir = std::path::Path::new(manifest).parent().and_then(|d| d.strip_prefix(&root).ok()).map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+        let tests: Vec<String> = p["targets"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter(|t| t["kind"].as_array().is_some_and(|k| k.iter().any(|k| k == "test")))
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        packages.push((name.to_string(), dir, tests));
+    }
+    let touched: Vec<&String> =
+        packages.iter().filter(|(_, dir, _)| !dir.is_empty() && changed.iter().any(|f| f.starts_with(&format!("{dir}/")))).map(|(n, _, _)| n).collect();
+    if touched.is_empty() {
+        println!("ci: fast tier, no package changed: never-crash suite only (`cargo xtask ci --full` runs everything)");
+    } else {
+        let names: Vec<&str> = touched.iter().map(|s| s.as_str()).collect();
+        println!("ci: fast tier: all tests of {}; never-crash suite of the rest (`--full` runs everything)", names.join(", "));
+        let mut c = Command::new(cargo);
+        c.args(["test", "--release"]);
+        for p in &touched {
+            c.args(["-p", p]);
+        }
+        run(&mut c)?;
+    }
+    let mut c = Command::new(cargo);
+    c.args(["test", "--release", "--workspace", "--lib", "--bins"]);
+    for p in &touched {
+        c.args(["--exclude", p]);
+    }
+    c.arg("--").args(SAFETY_TESTS);
+    run(&mut c)?;
+    for (name, _, tests) in packages.iter().filter(|(n, _, _)| !touched.contains(&n)) {
+        for t in tests.iter().filter(|t| safety(t)) {
+            run(Command::new(cargo).args(["test", "--release", "-p", name, "--test", t]))?;
+        }
+    }
+    Ok(())
 }
 
 /// The headless playback benchmark (`crates/ui-egui/examples/bench_playback.rs`); extra
@@ -551,7 +651,7 @@ fn main() -> ExitCode {
         "wasm" => wasm(),
         "assets" => assets(),
         "fixtures" => fixtures(&std::env::args().skip(2).collect::<Vec<_>>()),
-        "ci" => ci(),
+        "ci" => ci(&std::env::args().skip(2).collect::<Vec<_>>()),
         "bench" => bench(),
         "bench-playback" => bench_playback(),
         "web" => web(&std::env::args().skip(2).collect::<Vec<_>>()),
@@ -568,7 +668,7 @@ fn main() -> ExitCode {
             ico::run(&rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
         _ => Err(
-            "usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|fixtures [crate…]|parity [--area menus|effects|transitions] [--reference FILE] [--out FILE] [--min PERCENT]|ico OUT IN…|version [set X.Y.Z]|ci|bench [args]|bench-playback [args]>"
+            "usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|fixtures [crate…]|parity [--area menus|effects|transitions] [--reference FILE] [--out FILE] [--min PERCENT]|ico OUT IN…|version [set X.Y.Z]|ci [--full]|bench [args]|bench-playback [args]>"
                 .into(),
         ),
     };
