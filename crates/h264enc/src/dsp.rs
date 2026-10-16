@@ -212,7 +212,39 @@ pub fn satd_scalar(a: &[u8], sa: usize, b: &[u8], sb: usize, w: usize, h: usize)
     total
 }
 
+/// Sum of squared differences. On wasm, 16-wide blocks use [`ssd_simd`] (1.7x faster there); natively the
+/// scalar loop already vectorises better (widening multiplies) than the `wide` version.
+#[inline]
 pub fn ssd(a: &[u8], sa: usize, b: &[u8], sb: usize, w: usize, h: usize) -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(v) = ssd_simd(a, sa, b, sb, w, h) {
+        return v;
+    }
+    ssd_scalar(a, sa, b, sb, w, h)
+}
+
+/// SSD of a 16-wide block of up to 64 rows with `wide`: differences in `i16`, squared and pair-summed by
+/// `dot` into `i32` lanes (at most 2·255² per lane and row); `None` for other sizes or rows out of range.
+#[inline]
+#[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+pub fn ssd_simd(a: &[u8], sa: usize, b: &[u8], sb: usize, w: usize, h: usize) -> Option<u64> {
+    if w != 16 || h > 64 {
+        return None;
+    }
+    let mut acc = i32x4::ZERO;
+    for r in 0..h {
+        let ra = a.get(r * sa..)?.first_chunk::<16>()?;
+        let rb = b.get(r * sb..)?.first_chunk::<16>()?;
+        let (ra, rb) = (ra.as_chunks::<8>().0, rb.as_chunks::<8>().0);
+        let lo = row8(&ra[0]) - row8(&rb[0]);
+        let hi = row8(&ra[1]) - row8(&rb[1]);
+        acc += lo.dot(lo) + hi.dot(hi);
+    }
+    Some(acc.to_array().iter().map(|&v| v as u64).sum())
+}
+
+/// Scalar SSD: the reference for [`ssd`] and its path for other sizes.
+pub fn ssd_scalar(a: &[u8], sa: usize, b: &[u8], sb: usize, w: usize, h: usize) -> u64 {
     let mut s = 0u64;
     for r in 0..h {
         let ra = &a[r * sa..r * sa + w];
@@ -323,6 +355,19 @@ mod tests {
                 }
             }
         }
+        for (i, a) in pa.iter().enumerate() {
+            for (j, b) in pb.iter().enumerate() {
+                for (w, h) in [(16, 16), (16, 8), (16, 37), (8, 8), (4, 4)] {
+                    for (oa, ob) in [(0, 0), (sa + 3, 5), (2 * sa + 21, sb + 7)] {
+                        let want = ssd_scalar(&a[oa..], sa, &b[ob..], sb, w, h);
+                        assert_eq!(ssd(&a[oa..], sa, &b[ob..], sb, w, h), want, "ssd {w}x{h} planes {i}/{j}");
+                        if let Some(v) = ssd_simd(&a[oa..], sa, &b[ob..], sb, w, h) {
+                            assert_eq!(v, want, "ssd_simd {w}x{h} planes {i}/{j}");
+                        }
+                    }
+                }
+            }
+        }
         // a 200-row block exercises the u16 flush; rows past the end stop the sum like the scalar code
         let tall: Vec<u8> = (0..16 * 200).map(|i| if i % 3 == 0 { 255 } else { 0 }).collect();
         let zero = vec![0u8; 16 * 200];
@@ -357,6 +402,8 @@ mod tests {
         time("satd 16x8 simd   ", &|o| satd(&a[o..], 64, &b[o * 2..], 64, 16, 8));
         time("satd 8x16 scalar ", &|o| satd_scalar(&a[o..], 64, &b[o * 2..], 64, 8, 16));
         time("satd 8x16 simd   ", &|o| satd(&a[o..], 64, &b[o * 2..], 64, 8, 16));
+        time("ssd 16x16 scalar ", &|o| ssd_scalar(&a[o..], 64, &b[o * 2..], 64, 16, 16) as u32);
+        time("ssd 16x16 simd   ", &|o| ssd_simd(&a[o..], 64, &b[o * 2..], 64, 16, 16).unwrap_or(0) as u32);
         time("sad16 16x16 scal ", &|o| sad16_scalar(&a[o..], 64, &b[o * 2..], 64, 16));
         time("sad16 16x16 simd ", &|o| sad16(&a[o..], 64, &b[o * 2..], 64, 16));
     }

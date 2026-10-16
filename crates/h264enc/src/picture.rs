@@ -292,3 +292,48 @@ pub fn avg_into(dst: &mut [u8], src: &[u8]) {
         *d = ((*d as u16 + s as u16 + 1) >> 1) as u8;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Random planes with runs of 0 and 255 (extremes for the clipping).
+    fn plane(w: usize, h: usize, pad: usize, seed: u32) -> Plane {
+        let mut p = Plane::new(w, h, pad);
+        let mut st = seed;
+        for v in p.data.iter_mut() {
+            st = st.wrapping_mul(1103515245).wrapping_add(12345);
+            *v = match (st >> 24) % 4 {
+                0 => 0,
+                1 => 255,
+                _ => (st >> 16) as u8,
+            };
+        }
+        p
+    }
+
+    #[test]
+    fn mc_rows_match_scalar() {
+        let (a, b) = (plane(48, 32, 8, 5), plane(48, 32, 8, 6));
+        let s = a.stride;
+        for w in [16, 8, 4, 12, 2] {
+            for h in [16, 8, 4, 1] {
+                for (ia, ib) in [(0, 3), (s + 5, 2 * s + 1), (7 * s + 9, 5)] {
+                    for avg in [false, true] {
+                        let bb = if avg { Some((&b.data[..], ib)) } else { None };
+                        let mut x = vec![0u8; 16 * 16];
+                        let mut y = vec![0u8; 16 * 16];
+                        match w {
+                            16 => mc_rows::<16>(&a.data, ia, bb, s, h, &mut x, 16),
+                            8 => mc_rows::<8>(&a.data, ia, bb, s, h, &mut x, 16),
+                            4 => mc_rows::<4>(&a.data, ia, bb, s, h, &mut x, 16),
+                            _ => mc_rows_scalar(&a.data, ia, bb, s, w, h, &mut x, 16),
+                        }
+                        mc_rows_scalar(&a.data, ia, bb, s, w, h, &mut y, 16);
+                        assert_eq!(x, y, "w {w} h {h} at {ia}/{ib} avg {avg}");
+                    }
+                }
+            }
+        }
+    }
+}
