@@ -552,19 +552,7 @@ impl VideoFrame {
 /// One row of the direct Y'CbCr → R'G'B' display conversion (`Frame::to_rgba8` fast
 /// path): `ys`/`yo` are the luma scale/offset, `cs`-folded matrix coefficients are
 /// `crr`/`cgr`/`cgb`/`cbb`, chroma is subsampled by `1 << sx` horizontally.
-fn yuv8_row_display(
-    yrow: &[u8],
-    urow: &[u8],
-    vrow: &[u8],
-    sx: u32,
-    ys: f32,
-    yo: f32,
-    crr: f32,
-    cgr: f32,
-    cgb: f32,
-    cbb: f32,
-    row: &mut [u8],
-) {
+fn yuv8_row_display(yrow: &[u8], urow: &[u8], vrow: &[u8], sx: u32, ys: f32, yo: f32, crr: f32, cgr: f32, cgb: f32, cbb: f32, row: &mut [u8]) {
     #[cfg(any(target_arch = "wasm32", test))]
     if yuv8_row_display_wide(yrow, urow, vrow, sx, ys, yo, crr, cgr, cgb, cbb, row) {
         return;
@@ -604,19 +592,7 @@ fn yuv8_row_display_scalar(
 /// is bit-identical to the scalar path (the display checksums rely on it). Returns false
 /// for chroma subsampling it does not handle (sx > 1), leaving the row to the scalar path.
 #[cfg(any(target_arch = "wasm32", test))]
-fn yuv8_row_display_wide(
-    yrow: &[u8],
-    urow: &[u8],
-    vrow: &[u8],
-    sx: u32,
-    ys: f32,
-    yo: f32,
-    crr: f32,
-    cgr: f32,
-    cgb: f32,
-    cbb: f32,
-    row: &mut [u8],
-) -> bool {
+fn yuv8_row_display_wide(yrow: &[u8], urow: &[u8], vrow: &[u8], sx: u32, ys: f32, yo: f32, crr: f32, cgr: f32, cgb: f32, cbb: f32, row: &mut [u8]) -> bool {
     use wide::f32x4;
     if sx > 1 {
         return false;
