@@ -5,7 +5,7 @@
 //     --url http://127.0.0.1:8765/ --project P2 --codec h264 \
 //     --encoder auto|hardware|software --compositor auto|gpu|cpu --sink auto|opfs|blob \
 //     --build st|mt --runs 5 --warmup 1 --label "<what changed>" --out target/web-bench \
-//     [--validate] [--ref target/web-bench/ref/P2.mov] [--expect-sha hex] [--trace] [--no-scrub]
+//     [--validate] [--ref target/web-bench/ref/P2.mov] [--expect-sha hex] [--trace] [--no-scrub] [--legacy]
 //
 // Each run: a fresh tab, OPFS cleared, the project built through window.filmcraft, then
 // `file.exportMedia` while the harness scrubs the timeline ruler every 500 ms. Collected: wall
@@ -42,6 +42,9 @@ const opts = {
   scrub: !flag("no-scrub"),
   extraFlags: arg("flags", ""),
   keep: flag("keep"),
+  // pre-Phase-1 code: no encoder/sink parameters or flags exist; the configuration name still
+  // says what that path is (software encoder, CPU compositor, blob sink)
+  legacy: flag("legacy"),
 };
 if (!opts.attach && !opts.launch) opts.attach = "http://127.0.0.1:9222";
 const PROJECT_TIMEOUT_MS = opts.project === "P4" ? 90 * 60000 : 10 * 60000;
@@ -93,8 +96,8 @@ function appUrl() {
   const u = new URL(opts.url);
   const flags = ["empty", "fresh", "norecover"];
   if (opts.build === "st") flags.push("nothreads");
-  if (opts.compositor === "cpu") flags.push("cpu");
-  if (opts.encoder === "software") flags.push("softenc");
+  if (!opts.legacy && opts.compositor === "cpu") flags.push("cpu");
+  if (!opts.legacy && opts.encoder === "software") flags.push("softenc");
   for (const f of opts.extraFlags.split(",").filter(Boolean)) flags.push(f);
   u.search = "?" + flags.join("&");
   return u.href;
@@ -148,8 +151,8 @@ async function oneRun(browser, project, runDir, i) {
       bitrateKbps: BITRATE_KBPS(built.height),
     };
     if (!params.format) throw new Error(`codec ${opts.codec} is not exportable yet`);
-    if (opts.encoder !== "auto") params.encoder = opts.encoder;
-    if (opts.sink !== "auto") params.sink = opts.sink;
+    if (!opts.legacy && opts.encoder !== "auto") params.encoder = opts.encoder;
+    if (!opts.legacy && opts.sink !== "auto") params.sink = opts.sink;
     r.params = params;
 
     let downloadDone = null;
