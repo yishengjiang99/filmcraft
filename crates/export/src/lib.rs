@@ -372,8 +372,18 @@ pub struct ExportSettings {
     /// May H.264 be encoded by the system's hardware encoder (VideoToolbox on macOS, NVENC on
     /// Windows)? Off unless asked for: hardware output depends on the machine, so it is not
     /// byte-reproducible like the built-in encoder's (`determinism_tests`).
-    #[serde(default)]
+    /// On the web (wasm) the default is `Auto`: the browser's WebCodecs encoder is several times
+    /// faster than the built-in one there, and `Off` still gives the byte-identical built-in stream.
+    #[serde(default = "default_hardware_encoding")]
     pub hardware_encoding: HardwareEncoding,
+    /// Fail instead of falling back to the built-in encoder when no hardware encoder takes the
+    /// export (`file.exportMedia` `encoder: "hardware"`).
+    #[serde(default)]
+    pub require_hardware: bool,
+    /// Where a streamed output goes when the host registered a [`StreamTarget`] (the web):
+    /// "auto", "opfs", "blob", or "memory" (buffered in memory, handed to [`Self::sink`] at the end).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_sink: Option<String>,
     /// Composite the exported frames on the GPU instead of the CPU reference renderer (Export ▸
     /// GPU rendering: Auto / Off, Off by default). Off = the CPU reference renderer exactly.
     #[serde(default)]
@@ -428,6 +438,107 @@ enum AudioWriter {
 enum Out {
     File(std::io::BufWriter<std::fs::File>),
     Mem(std::io::Cursor<Vec<u8>>),
+    /// Streamed to a registered [`StreamTarget`] (the web's OPFS / Blob sinks): only a small
+    /// buffer stays in memory, however long the export.
+    Stream(StreamOut),
+}
+
+/// A positioned byte sink an export streams into (registered by the host with
+/// [`register_stream_target`]; the web app writes to OPFS or JS-side chunks). Writes are mostly
+/// appends; the muxer seeks back once to patch a size.
+pub trait StreamTarget: Send {
+    fn write_at(&mut self, position: u64, data: &[u8]) -> std::io::Result<()>;
+    /// Every byte was written: `length` is the file size.
+    fn finish(self: Box<Self>, length: u64) -> std::io::Result<()>;
+}
+
+/// Opens the stream target for an output `path` with the requested sink kind (`ExportSettings::
+/// stream_sink`): `None` = this host does not stream it (the output is buffered as before).
+pub type StreamTargetFactory = fn(path: &str, kind: &str) -> Option<std::io::Result<Box<dyn StreamTarget>>>;
+
+fn stream_target_factory() -> &'static RwLock<Option<StreamTargetFactory>> {
+    static F: OnceLock<RwLock<Option<StreamTargetFactory>>> = OnceLock::new();
+    F.get_or_init(|| RwLock::new(None))
+}
+
+/// Register the host's stream target (exports with an [`ExportSettings::sink`] stream through it).
+pub fn register_stream_target(f: StreamTargetFactory) {
+    *stream_target_factory().write().unwrap_or_else(|e| e.into_inner()) = Some(f);
+}
+
+/// Bytes kept before a chunk goes to the [`StreamTarget`].
+const STREAM_CHUNK: usize = 4 << 20;
+
+/// `Write + Seek` over a [`StreamTarget`]: contiguous writes are gathered into [`STREAM_CHUNK`]
+/// chunks; a seek flushes them.
+struct StreamOut {
+    target: Option<Box<dyn StreamTarget>>,
+    buf: Vec<u8>,
+    /// File position of `buf[0]`.
+    buf_pos: u64,
+    /// The cursor.
+    pos: u64,
+    /// File size so far.
+    len: u64,
+}
+
+impl StreamOut {
+    fn new(target: Box<dyn StreamTarget>) -> Self {
+        StreamOut { target: Some(target), buf: Vec::with_capacity(STREAM_CHUNK), buf_pos: 0, pos: 0, len: 0 }
+    }
+
+    fn flush_buf(&mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            let t = self.target.as_mut().ok_or_else(|| std::io::Error::other("the export stream was already finished"))?;
+            t.write_at(self.buf_pos, &self.buf)?;
+            self.buf.clear();
+        }
+        self.buf_pos = self.pos;
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<u64> {
+        self.flush_buf()?;
+        let t = self.target.take().ok_or_else(|| std::io::Error::other("the export stream was already finished"))?;
+        t.finish(self.len)?;
+        Ok(self.len)
+    }
+}
+
+impl Write for StreamOut {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.pos != self.buf_pos.saturating_add(self.buf.len() as u64) {
+            self.flush_buf()?;
+        }
+        self.buf.extend_from_slice(data);
+        self.pos = self.pos.saturating_add(data.len() as u64);
+        self.len = self.len.max(self.pos);
+        if self.buf.len() >= STREAM_CHUNK {
+            self.flush_buf()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Seek for StreamOut {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        let target = match to {
+            std::io::SeekFrom::Start(p) => Some(p),
+            std::io::SeekFrom::End(d) => self.len.checked_add_signed(d),
+            std::io::SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+        }
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek before the start of the export stream"))?;
+        if target != self.pos {
+            self.flush_buf()?;
+            self.pos = target;
+            self.buf_pos = target;
+        }
+        Ok(self.pos)
+    }
 }
 
 impl Out {
@@ -438,6 +549,13 @@ impl Out {
     /// An output file at `path` (OP-Atom exports write several).
     fn create_path(settings: &ExportSettings, path: &str) -> Result<Out> {
         if settings.sink.is_some() {
+            let factory = *stream_target_factory().read().unwrap_or_else(|e| e.into_inner());
+            let kind = settings.stream_sink.as_deref().unwrap_or("auto");
+            if kind != "memory"
+                && let Some(t) = factory.and_then(|f| f(path, kind))
+            {
+                return Ok(Out::Stream(StreamOut::new(t.map_err(|e| ExportError::Io(format!("{path}: {e}")))?)));
+            }
             return Ok(Out::Mem(std::io::Cursor::new(Vec::new())));
         }
         let f = std::fs::File::create(path).map_err(|e| ExportError::Io(format!("{path}: {e}")))?;
@@ -456,6 +574,7 @@ impl Out {
                 Ok(std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
             }
             Out::Mem(c) => write_output(settings, path, c.into_inner()),
+            Out::Stream(st) => st.finish().map_err(|e| ExportError::Io(format!("{path}: {e}"))),
         }
     }
 }
@@ -476,12 +595,14 @@ impl Write for Out {
         match self {
             Out::File(w) => w.write(buf),
             Out::Mem(w) => w.write(buf),
+            Out::Stream(w) => w.write(buf),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Out::File(w) => w.flush(),
             Out::Mem(w) => w.flush(),
+            Out::Stream(w) => w.flush(),
         }
     }
 }
@@ -491,6 +612,7 @@ impl std::io::Seek for Out {
         match self {
             Out::File(w) => w.seek(pos),
             Out::Mem(w) => w.seek(pos),
+            Out::Stream(w) => w.seek(pos),
         }
     }
 }
@@ -574,7 +696,9 @@ impl Default for ExportSettings {
             h264_level: None,
             bitrate_mode: BitrateMode::default(),
             crf: DEFAULT_CRF,
-            hardware_encoding: HardwareEncoding::default(),
+            hardware_encoding: default_hardware_encoding(),
+            require_hardware: false,
+            stream_sink: None,
             gpu_rendering: GpuRendering::Off,
             max_bitrate_kbps: None,
             adaptive_bitrate: None,
@@ -595,6 +719,11 @@ impl Default for ExportSettings {
 
 /// [`ExportSettings::crf`] of new settings and of settings saved before it existed.
 pub const DEFAULT_CRF: f32 = 23.0;
+
+/// `Auto` on the web (WebCodecs), `Off` natively (see [`ExportSettings::hardware_encoding`]).
+fn default_hardware_encoding() -> HardwareEncoding {
+    if cfg!(target_arch = "wasm32") { HardwareEncoding::Auto } else { HardwareEncoding::Off }
+}
 
 fn default_crf() -> f32 {
     DEFAULT_CRF
@@ -748,6 +877,27 @@ pub trait VideoEncoder: Send {
     /// First-pass statistics of a two-pass encode (H.264).
     fn pass_stats(&self) -> Option<filmcraft_h264enc::PassStats> {
         None
+    }
+    /// A hardware encoder (VideoToolbox, NVENC, the browser's WebCodecs encoder): an export that
+    /// requires one ([`ExportSettings::require_hardware`]) fails when the encoder made is not.
+    fn is_hardware(&self) -> bool {
+        false
+    }
+    /// Asynchronous encoders (the browser's WebCodecs, whose output arrives on later event-loop
+    /// turns): whether [`Self::encode`] may take another picture now. While false the stepped
+    /// [`Exporter`] yields ([`Step::Pending`]) and asks again on its next step. An error the encoder
+    /// reported meanwhile comes back here. Synchronous encoders are always ready.
+    fn ready(&mut self) -> Result<bool> {
+        Ok(true)
+    }
+    /// Packets an asynchronous encoder produced since the last call, without taking a picture.
+    fn poll(&mut self) -> Result<Vec<EncodedPacket>> {
+        Ok(Vec::new())
+    }
+    /// After [`Self::flush`]: whether an asynchronous encoder still owes packets; the exporter keeps
+    /// yielding and [`Self::poll`]ing until it does not.
+    fn pending(&self) -> bool {
+        false
     }
 }
 
@@ -1847,7 +1997,11 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
                 Step::Progress => {}
                 Step::Done(r) => return Ok(r),
                 // only asynchronous (web) sources defer; a blocking export cannot wait for them
-                Step::Pending => return Err(ExportError::Io("media data is still loading; run the export as a stepped job".into())),
+                Step::Pending => {
+                    return Err(ExportError::Io(
+                        "media data is still loading, or the encoder works asynchronously (the browser's WebCodecs): run the export as a stepped job (wait: false)".into(),
+                    ));
+                }
             }
         }
     }
@@ -2010,7 +2164,11 @@ mod surround_tests;
 mod mxf_tests;
 
 #[cfg(test)]
+mod async_encoder_tests;
+#[cfg(test)]
 mod determinism_tests;
+#[cfg(test)]
+mod stream_out_tests;
 
 #[cfg(test)]
 mod hdr_tests;

@@ -64,6 +64,7 @@
     addEventListener("error", (ev) => { if (window.filmcraftLoad.readyMs && isFatal(ev.error || ev.message)) window.filmcraftFatal(ev.error || ev.message); });
     addEventListener("unhandledrejection", (ev) => { if (window.filmcraftLoad.readyMs && isFatal(ev.reason)) window.filmcraftFatal(ev.reason); });
   </script>
+  <script src="export-sink.js"></script>
   <script type="module">
     // `__FC_BUILD__` / `__FC_BUILD_MT__` are replaced by `cargo xtask web` with hashes of the
     // builds: the glue and the wasm are cached as immutable, so their URLs must change with

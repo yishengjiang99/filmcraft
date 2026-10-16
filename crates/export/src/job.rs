@@ -175,6 +175,8 @@ pub struct Exporter {
     queued: Vec<EncodedPacket>,
     /// Created after the first group was encoded (encoders may finalise their codec config then).
     mux: Option<Mp4Writer<Out>>,
+    /// The encoder was flushed; an asynchronous one may still owe packets ([`VideoEncoder::pending`]).
+    flushed: bool,
     /// MXF exports write through this instead of `mux`.
     mxf: Option<MxfMux>,
     seq: ItemId,
@@ -205,12 +207,22 @@ pub(crate) fn hdr_output(working_hdr: bool, sdr: bool, format: Format, hdr_avail
 }
 
 fn make_venc(settings: &ExportSettings, w: u32, h: u32, rate: FrameRate) -> Result<Box<dyn VideoEncoder>> {
-    video_factories()
+    let enc = video_factories()
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .find_map(|fac| fac(settings.video_format(), w, h, rate, settings))
-        .ok_or_else(|| ExportError::Unsupported(format!("{} encoder not available yet", settings.video_format().label())))?
+        .ok_or_else(|| ExportError::Unsupported(format!("{} encoder not available yet", settings.video_format().label())))??;
+    if settings.require_hardware && !enc.is_hardware() {
+        return Err(ExportError::Unsupported(format!(
+            "no hardware {} encoder takes this export ({}x{}, {}); export with the software encoder instead (encoder: software)",
+            settings.video_format().label(),
+            w,
+            h,
+            if settings.signal.is_hdr() { "HDR" } else { "these settings" }
+        )));
+    }
+    Ok(enc)
 }
 
 impl Exporter {
@@ -282,6 +294,7 @@ impl Exporter {
             first_pass: two_pass,
             queued: Vec::new(),
             mux: None,
+            flushed: false,
             mxf: None,
             seq,
             project: project.clone(),
@@ -460,6 +473,13 @@ impl Exporter {
             return Ok(Step::Progress);
         }
         if self.next < self.f1 {
+            // an asynchronous encoder (WebCodecs) that is busy or still owes its codec config:
+            // collect what it produced and yield, so its output callbacks can run
+            if !self.venc.ready()? {
+                let packets = self.venc.poll()?;
+                self.queued.extend(packets);
+                return Ok(Step::Pending);
+            }
             return self.step_batch(sources, progress);
         }
         self.ahead = None;
@@ -474,6 +494,19 @@ impl Exporter {
             return Ok(Step::Progress);
         }
         let finishing = web_time::Instant::now();
+        // flush the encoder; an asynchronous one delivers the rest on later steps
+        if !self.flushed {
+            let packets = self.venc.flush()?;
+            self.queued.extend(packets);
+            self.flushed = true;
+        }
+        let packets = self.venc.poll()?;
+        self.queued.extend(packets);
+        if self.venc.pending() {
+            // errors the encoder reported while flushing surface through `ready`
+            self.venc.ready()?;
+            return Ok(Step::Pending);
+        }
         let mixed = self.audio.as_mut().and_then(|a| a.rest(sources));
         if filmcraft_media::pending::take() {
             return Ok(Step::Pending);
@@ -481,8 +514,7 @@ impl Exporter {
         if self.mux.is_none() && self.mxf.is_none() {
             self.open_mux()?;
         }
-        let mut tail = std::mem::take(&mut self.queued);
-        tail.extend(self.venc.flush()?);
+        let tail = std::mem::take(&mut self.queued);
         self.write_video(tail)?;
         self.write_audio(mixed)?;
         if let (Some(at), Some(a)) = (self.at, self.aenc.as_mut()) {

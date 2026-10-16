@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 # and clippy stay cheap). Build with `cargo xtask web` (see docs/web.md).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 filmcraft-engine = { workspace = true }
+filmcraft-export = { workspace = true }
 filmcraft-ui-egui = { workspace = true }
 filmcraft-media = { workspace = true }
 filmcraft-codecs = { workspace = true }

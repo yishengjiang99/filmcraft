@@ -214,6 +214,24 @@ anything egui does**. The honest verdict:
 | 4. GPU completion | Compute scopes; worker-side WebGPU for previews; CPU-compositor fallback confined to workers | 2, 3 | Colour work at full refresh; the WebGL2 path degrades in frame rate, not in UI responsiveness |
 | 5. Hardening | Safari/Firefox matrix on the fallback build, memory ceilings, pool sizing on low-core machines, perf CI gate from phase 0 | 2–4 | The fallback stays a supported product, not a legacy path |
 
+## Export track
+
+Export has its own plan, `docs/export-optimize-gpu.md` (GPU-first, hardware-encoded, streaming web
+export), with a CDP benchmark harness and measured results in `docs/benchmarks/web-export.md`. It
+maps onto the phases above:
+
+- **WebCodecs hardware encoder** (`webcodecs_encode.rs`, export phase 1) needs nothing from
+  phases 1–3 here: it plugs into the stepped exporter through asynchronous `VideoEncoder` hooks
+  (`ready` / `poll` / `pending`).
+- **Streaming output** (`export_sink.rs` + `web/export-sink.js`, export phase 3): exports stream to
+  OPFS (or JS-side chunks) instead of being buffered in wasm memory, which also lifts the 4 GiB
+  ceiling for long exports. `FileSystemWritableFileStream.write` rejects views of shared memory,
+  so the threaded build copies chunks; the worker-side `FileSystemSyncAccessHandle.write` takes an
+  `AllowSharedBufferSource` and can write straight from wasm memory (with phase 3 here).
+- **GPU compositing for export** (export phase 2) and **export in a worker** (export phase 4)
+  build on phases 2–4 here: on the main thread `ExportRenderer`'s synchronous readback cannot
+  work, so the web path needs an asynchronous render → `VideoFrame` hand-off.
+
 ## Risks and constraints
 
 - **Nightly toolchain** for the web build only, pinned like the wasm-bindgen CLI is

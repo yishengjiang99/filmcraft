@@ -161,6 +161,12 @@ pub fn install() -> Result<(), JsValue> {
                 .and_then(|m| js_sys::Reflect::get(&m.buffer(), &"byteLength".into()).ok())
                 .and_then(|n| n.as_f64());
             v["memory"] = json!({ "wasmBytes": wasm_bytes });
+            // export path: encoder backend and counters, compositor, output sink, thread
+            let mut export = crate::webcodecs_encode::stats();
+            export["compositor"] = json!("cpu");
+            export["sink"] = json!(crate::export_sink::last_kind().unwrap_or_else(|| "memory".into()));
+            export["thread"] = json!("main");
+            v["export"] = export;
             to_js(&v)
         })
         .into_js_value(),

@@ -5,7 +5,7 @@
 //     --url http://127.0.0.1:8765/ --project P2 --codec h264 \
 //     --encoder auto|hardware|software --compositor auto|gpu|cpu --sink auto|opfs|blob \
 //     --build st|mt --runs 5 --warmup 1 --label "<what changed>" --out target/web-bench \
-//     [--validate] [--ref target/web-bench/ref/P2.mov] [--expect-sha hex] [--trace] [--no-scrub] [--legacy]
+//     [--validate] [--ref target/web-bench/ref/P2.mov] [--expect-sha hex] [--trace] [--no-scrub] [--legacy] [--timeout-min 10]
 //
 // Each run: a fresh tab, OPFS cleared, the project built through window.filmcraft, then
 // `file.exportMedia` while the harness scrubs the timeline ruler every 500 ms. Collected: wall
@@ -47,7 +47,7 @@ const opts = {
   legacy: flag("legacy"),
 };
 if (!opts.attach && !opts.launch) opts.attach = "http://127.0.0.1:9222";
-const PROJECT_TIMEOUT_MS = opts.project === "P4" ? 90 * 60000 : 10 * 60000;
+const PROJECT_TIMEOUT_MS = Number(arg("timeout-min", opts.project === "P4" ? "90" : "10")) * 60000;
 const CODEC_FORMAT = { h264: "h264", hevc: "hevc" };
 // Pinned rate control so every encoder path is compared at equal bitrate.
 const BITRATE_KBPS = (height) => (height > 1080 ? 40000 : 12000);

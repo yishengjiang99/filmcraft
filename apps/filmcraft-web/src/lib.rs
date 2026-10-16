@@ -21,12 +21,14 @@
 pub mod api;
 pub mod audio;
 pub mod download_pacing;
+pub mod export_sink;
 pub mod fs;
 pub mod import;
 pub mod opfs;
 pub mod recovery;
 pub mod recovery_policy;
 pub mod webcodecs;
+pub mod webcodecs_encode;
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -140,6 +142,9 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     let restored = if opfs::available() && !query_flag("fresh") { recovery::restore_media().await } else { 0 };
     let recovered = if query_flag("fresh") || query_flag("norecover") { None } else { recovery::load_snapshot().await };
     webcodecs::probe().await;
+    if !query_flag("softenc") {
+        webcodecs_encode::probe().await;
+    }
 
     api::install()?;
     import::install_drop_handlers()?;
@@ -168,6 +173,8 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
                     }
                 });
                 webcodecs::install();
+                webcodecs_encode::install();
+                export_sink::install();
                 let mut session = Session::new(Arc::new(fs::WebServices));
                 let mut toast = None;
                 if let Some((name, bytes)) = recovered {

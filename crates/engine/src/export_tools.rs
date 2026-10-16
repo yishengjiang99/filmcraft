@@ -262,6 +262,25 @@ pub fn settings_from_params(s: &Session, p: &Value, cmd: &str) -> Result<(Option
             other => serde_json::from_value(other.clone()).map_err(|_| bad(cmd, "hardwareEncoding: off | auto"))?,
         };
     }
+    // `encoder`: auto (hardware when the system has one that takes the export, else built-in),
+    // hardware (fail instead of falling back), software (the built-in, byte-reproducible encoder)
+    if let Some(v) = p.get("encoder") {
+        let (hw, require) = match v.as_str() {
+            Some("auto") => (HardwareEncoding::Auto, false),
+            Some("hardware") => (HardwareEncoding::Auto, true),
+            Some("software") => (HardwareEncoding::Off, false),
+            _ => return Err(bad(cmd, "encoder: auto | hardware | software")),
+        };
+        settings.hardware_encoding = hw;
+        settings.require_hardware = require;
+    }
+    // `sink`: where a web export streams (auto | opfs | blob | memory); native exports ignore it
+    if let Some(v) = p.get("sink") {
+        match v.as_str() {
+            Some(k @ ("auto" | "opfs" | "blob" | "memory")) => settings.stream_sink = Some(k.to_string()),
+            _ => return Err(bad(cmd, "sink: auto | opfs | blob | memory")),
+        }
+    }
     if let Some(v) = p.get("gpuRendering") {
         settings.gpu_rendering = match v {
             Value::Bool(on) => {

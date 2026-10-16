@@ -82,6 +82,10 @@ fn composition_offset(pts: i64, dts: i64, den: i64) -> i32 {
 }
 
 impl VideoEncoder for NvencEncoder {
+    fn is_hardware(&self) -> bool {
+        true
+    }
+
     fn sample_entry(&self) -> SampleEntry {
         let (sps, pps) = self.enc.parameter_sets();
         // `config` declines sizes above u16::MAX

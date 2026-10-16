@@ -113,6 +113,22 @@ eframe creates a WebGPU device when the browser has one, else WebGL2. FilmCraft'
 (`filmcraft-gpu`) is used on WebGPU; on WebGL2 frames are composited on the CPU. Check
 `filmcraft.info().backend` and `.compositor`.
 
+### Export
+
+Exports run as stepped jobs on the UI thread (`Session::pump_jobs`, ~30 ms per frame). The picture
+is composited on the CPU; H.264 and HEVC are encoded by the browser's WebCodecs `VideoEncoder`
+(hardware where the browser has one: `webcodecs_encode.rs`) and otherwise by the built-in H.264
+encoder. The choice is `file.exportMedia` `encoder`: `auto` (default on the web: WebCodecs when the
+start-up `isConfigSupported` probe passed with `prefer-hardware`), `hardware` (fail instead of
+falling back), `software` (the built-in, byte-reproducible encoder). `?softenc` skips the probe, so
+everything uses the built-in encoder. The RGBA picture is converted to I420 in Rust with the same
+BT.709 limited-range conversion as the software and VideoToolbox paths and handed over as a
+`VideoFrame` tagged BT.709; the sample entry comes from the encoder's `decoderConfig.description`.
+WebCodecs is asynchronous: the exporter yields (`Step::Pending`) while the encoder's queue is full
+(> 8) or its codec record has not arrived, and after `flush` until the last chunk came back.
+`filmcraft.info().export` reports the backend (`webcodecs-hw` / `h264enc`), queue high-water mark,
+encoder errors, compositor, sink and thread.
+
 ## `window.filmcraft`: the agent / test API
 
 The control channel of the desktop app (`docs/control-protocol.md`) as promises. Results resolve
@@ -140,6 +156,55 @@ await filmcraft.execute("file.newSequence", {fromItem: 48});
 await filmcraft.request("ui.playback", {action: "play"});
 const {job} = await filmcraft.execute("file.exportMedia", {format: "h264", path: "/exports/out.mp4"});
 ```
+
+## Web platform support (export work)
+
+Everything below is used behind feature detection; the pure-Rust path is the fallback that always
+works. "Measured" = probed by `apps/filmcraft-web/tests/probe-env.mjs` on the bench machine
+(Chrome 155.0.8059.40, Apple M4 Pro, macOS 27.0.1; `target/web-bench/env.json`); other columns
+are from MDN / Chrome Platform Status and were not measured here.
+
+| API | Use | Chrome 155 (measured) | Firefox | Safari |
+|---|---|---|---|---|
+| WebCodecs `VideoEncoder` H.264 (hardware) | export encoder | yes, High/Main/Baseline up to 4K; CBR, VBR, quantizer | yes (software/hardware varies) | yes |
+| WebCodecs `VideoEncoder` HEVC Main (hardware) | HEVC export | yes, 1080p and 4K | no | yes |
+| WebCodecs HEVC Main 10, AV1, VP9 hardware encode | – | no (AV1, VP9 software only) | software AV1/VP9 | varies |
+| WebCodecs `AudioEncoder` AAC / Opus | – (the built-in AAC encoder costs < 1 % of an export) | AAC yes, Opus yes | Opus | AAC |
+| WebCodecs `VideoDecoder` | import / playback decode | H.264, HEVC, VP9, AV1 hardware | yes | yes |
+| WebGPU (+ `timestamp-query`, `shader-f16`) | compositor, GPU timing | yes, yes, yes | yes (recent) | yes (recent) |
+| `new VideoFrame(OffscreenCanvas)` | zero-copy frames | yes | yes | yes |
+| OPFS + `createSyncAccessHandle` (worker) | streaming sink | yes | yes | yes |
+| `showSaveFilePicker` / `showDirectoryPicker` | streaming sink | yes | no | no |
+| `CompressionStream("deflate-raw")` | ZIP of image sequences | yes | yes | yes |
+| JSPI (`WebAssembly.Suspending`) | async bridging | yes | no | no |
+| wasm memory64 | > 4 GiB heaps | yes | yes | no |
+| SharedArrayBuffer (COOP/COEP) | threaded build | yes | yes | yes |
+| `scheduler.yield` / `postTask` | adaptive pump | yes | partial | no |
+| Long Animation Frames API | bench (jank) | yes | no | no |
+| Wake Lock, Web Locks, `setAppBadge`, Notifications | long exports | yes | partial | partial |
+
+Note: `FileSystemWritableFileStream.write` rejects views of shared memory (its IDL takes a
+`BufferSource`), so writes from the threaded build copy first; `FileSystemSyncAccessHandle.write`
+takes an `AllowSharedBufferSource`, so the worker OPFS sink can write straight from wasm memory.
+
+## Export benchmark
+
+`docs/export-optimize-gpu.md` is the plan; numbers live in `docs/benchmarks/web-export.md`. The
+harness (no npm packages; ffmpeg only as fixture generator and oracle):
+
+```sh
+cargo xtask web --threads --serve 8765 &                     # release + wasm-opt, st + mt builds
+node apps/filmcraft-web/tests/probe-env.mjs --url http://127.0.0.1:8765/   # env.json (GPU, codecs, APIs)
+node apps/filmcraft-web/tests/fixtures.mjs                    # deterministic media → dist/bench/
+node apps/filmcraft-web/tests/make-ref.mjs                    # CLI reference renders (PSNR/SSIM)
+node apps/filmcraft-web/tests/bench-matrix.mjs --label <what changed> --url http://127.0.0.1:8765/
+node apps/filmcraft-web/tests/bench-compare.mjs --baseline baseline --doc docs/benchmarks/web-export.md
+```
+
+`export-bench.mjs` attaches to a running, headed Chrome (`--attach http://127.0.0.1:9222`; headless
+GPU numbers are not representative) and runs one configuration; `validate-export.mjs` checks an
+output file (ffprobe layout and colour, frame count, `-xerror`, A/V sync from the fixtures' flash +
+beep markers, PSNR/SSIM vs the reference, sha256).
 
 ## Browser test
 

@@ -99,6 +99,22 @@ pub fn register_blob(name: &str, blob: web_sys::Blob) -> String {
     })
 }
 
+/// Put a Blob at `path` (a streamed export: its bytes stay outside wasm memory), replacing what
+/// was there.
+pub fn put_blob(path: &str, blob: web_sys::Blob) {
+    let size = blob.size() as u64;
+    FS.with(|fs| {
+        let mut fs = fs.borrow_mut();
+        let id = fs.next_id;
+        fs.next_id += 1;
+        fs.blobs.insert(id, blob);
+        if let Some(Entry::Blob { id: old, .. }) = fs.entries.insert(path.to_string(), Entry::Blob { id, size }) {
+            fs.blobs.remove(&old);
+        }
+        fs.recount();
+    });
+}
+
 /// Put bytes at a path (no download).
 pub fn put(path: &str, data: Vec<u8>) {
     FS.with(|fs| fs.borrow_mut().entries.insert(path.to_string(), Entry::Mem(data.into())));
@@ -409,9 +425,13 @@ impl Services for WebServices {
 /// Offer bytes as a browser download named `name`. Downloads are clicked at least
 /// [`crate::download_pacing::GAP_MS`] apart: Chrome drops a burst of them (#378).
 pub fn download(name: &str, data: &[u8]) -> Result<(), wasm_bindgen::JsValue> {
+    download_blob(name, &bytes_to_blob(data, "application/octet-stream")?)
+}
+
+/// [`download`] of a Blob (an OPFS `File` downloads straight from disk).
+pub fn download_blob(name: &str, blob: &web_sys::Blob) -> Result<(), wasm_bindgen::JsValue> {
     let doc = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
-    let blob = bytes_to_blob(data, "application/octet-stream")?;
-    let url = web_sys::Url::create_object_url_with_blob(&blob)?;
+    let url = web_sys::Url::create_object_url_with_blob(blob)?;
     let a: web_sys::HtmlAnchorElement = doc.create_element("a")?.dyn_into()?;
     a.set_href(&url);
     a.set_download(file_name(name));

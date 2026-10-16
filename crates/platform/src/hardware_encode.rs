@@ -195,6 +195,10 @@ impl HardwareEncoder {
 }
 
 impl VideoEncoder for HardwareEncoder {
+    fn is_hardware(&self) -> bool {
+        true
+    }
+
     fn sample_entry(&self) -> SampleEntry {
         let c = self.vt.config();
         let (w, h) = (c.width.min(u32::from(u16::MAX)) as u16, c.height.min(u32::from(u16::MAX)) as u16);
