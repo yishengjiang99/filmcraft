@@ -15,7 +15,7 @@ cites a `target/web-bench/results.jsonl` line (label + git sha) on the bench mac
 | Phase 3 streaming output (OPFS / Blob) | done, committed (`bd13e6c8`); OPFS + Blob sinks validated; memory effect not yet separated from Phase 1 (below) |
 | Phase 2 GPU compositing for export | designed, not started (below) |
 | Phase 4 off the main thread | not started; design notes below |
-| Phase 5 simd128 in `h264enc` | not started |
+| Phase 5 simd128 in `h264enc` | done (branch of the Phase 5 agent): software encoder 1.9x faster on wasm (node), bytes unchanged; Chrome export not yet measured |
 
 Also done on the way: `cargo xtask ci` fast test tier (`--full` for everything), OPFS writes in
 the threaded build fixed (recovery snapshots were never saved), rustfmt drift on `main`.
@@ -136,4 +136,17 @@ matroska changes or `Cargo.lock` changes (which forces the full suite).
 5. Phase 4: in the `mt` build the FrameServer already renders previews on worker threads;
    offloading export rendering there (main thread polls, never blocks: `Atomics.wait` is not
    allowed on it) parallelizes the CPU path too. WebCodecs decode sessions are UI-thread-only.
-6. Phase 5 (`simd128` kernels in `h264enc`, bit-exact vs scalar) for the software fallback.
+6. Phase 5 follow-ups: measure the software path in Chrome (`--encoder software`, P1s must keep
+   sha `97aad066…`; encode stage was 17.9 s); next hot spots on wasm are 16x16 SATD in the sub-pel
+   search, CABAC `renorm` (bit-at-a-time; a carry-propagating byte writer would give the same bits),
+   `mc_luma` and the half-sample interpolation. `Preset::Speed` was *not* made the wasm default (it
+   changes the output); offer it as an explicit opt-in if wanted.
+
+## Phase 5 (software H.264 fallback, `crates/h264enc`)
+
+`wide` SIMD kernels (SATD, SAD, SSD on wasm, 4x4/8x8 transforms + quant + dequant, residual
+gather/reconstruction) plus output-identical algorithmic savings; details and per-kernel numbers in
+[`crates/h264enc/README.md`](../crates/h264enc/README.md#speed). Single-threaded 1080p P1s footage with
+the export's settings: native 79.8 → 45.7 ms/frame, wasm `simd128` (node 22, `h264enc_bench` as
+wasm32-wasip1) 109–117 → 58–61 ms/frame (1.9x; target ≥ 1.8x). Bit-exact: per-kernel tests vs the
+scalar code, `golden_bytes` (also run as wasm), export determinism tests.

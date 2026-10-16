@@ -79,7 +79,46 @@ Results on the synthetic content (moving gradient, grain noise, text-like edges,
 Development tool: `cargo run --release -p filmcraft-h264enc --example h264enc_synth -- W H FRAMES
 [profile] [preset] [bframes] [qpN|crfN|cbrN|vbrN] [slices] [synth|testsrc2|mandelbrot]` encodes, decodes with
 ffmpeg and reports speed, bitrate, PSNR and any encoder/decoder mismatch (`MAP=1` prints a per-MB mismatch map,
-`PERF=k` cycles k source pictures for speed runs).
+`PERF=k` cycles k source pictures for speed runs; `yuv:FILE` encodes a raw yuv420p file).
+
+## Speed
+
+The hot kernels are portable 128-bit SIMD written with `wide` (safe API; wasm `simd128`, NEON, SSE2, plain arrays
+elsewhere), each **bit-identical** to the scalar code, which stays in the crate as the test reference (and as the
+path for unusual block sizes):
+
+| Kernel | Where | Scalar → SIMD, ns (native M4 Pro / wasm simd128, node 22) |
+|---|---|---|
+| SATD 16x16 / 8x8 / 8x16 | `dsp::satd` | 33 → 26 / 28 → 6 / 53 → 12 (wasm: 58 → 31 / 49 → 8 / 95 → 15) |
+| SAD 16x16 | `dsp::sad16` | 10 → 9 (wasm 27 → 14) |
+| SSD 16x16 (wasm only; native scalar is faster) | `dsp::ssd` | wasm 32 → 18 |
+| 4x4 residual pipeline, 16 blocks | `kernels` (residual, fdct4, quant4, dequant4, idct4, recon) | 264 → 224 (wasm 453 → 294) |
+| 8x8 residual pipeline, 4 blocks | `kernels` (residual, fdct8, quant8, dequant8, idct8, recon) | 372 → 243 (wasm 693 → 375) |
+
+`kernels` holds several blocks per vector (`value[pos][lane]`, lane = block) so the transforms are the scalar
+butterflies on four blocks at a time; gathers/scatters use one byte swizzle per row; 4x4 quantisation and the 8x8
+one run in exact 32-bit arithmetic (bounds in the doc comments). Output-identical algorithmic savings: the adaptive
+4x4/8x8 choice keeps both coded results instead of coding the winner a third time, sub-pel refinement memoises
+costs of vectors it already evaluated, all-zero blocks skip scan/decimation, and a macroblock without levels copies
+its prediction instead of running the inverse transform.
+
+Whole encoder, single-threaded (`--no-default-features`, as on the web), 1080p of P1s footage with the export's
+settings (High, Balanced, 2 B-frames, VBR 12 Mb/s, 17 slices): native 79.8 → 45.7 ms/frame (1.75x), wasm simd128
+under node 22 109–117 → 58–61 ms/frame (1.9x). Bytes unchanged.
+
+```sh
+cargo run --release -p filmcraft-h264enc --no-default-features --example h264enc_bench -- 1920 1080 30 clip.yuv
+RUSTFLAGS="-C target-feature=+simd128" cargo build --release -p filmcraft-h264enc --no-default-features \
+  --example h264enc_bench --target wasm32-wasip1    # run the .wasm with node:wasi (preopen the yuv's directory)
+cargo test --release -p filmcraft-h264enc --lib bench_ -- --ignored --nocapture   # kernel timings
+```
+
+Bit-exactness: per-kernel tests against the scalar code (random, 0/255, checkerboard and near-flat blocks, odd
+strides and offsets, every QP; residuals up to ±600 for the clipping), `tests/golden_bytes.rs` (six configurations
+hashed with the scalar encoder before the SIMD work; slice counts pinned so hashes are machine-independent), and the
+export determinism tests. The lib tests and `golden_bytes` also pass as `wasm32-wasip1` with `simd128` under node,
+so the SIMD wasm build writes the same bytes as the scalar native encoder. Node 22 occasionally segfaults while
+tiering up this module (V8, not the encoder); run it with `--no-liftoff`.
 
 ## Limitations / not yet implemented
 
