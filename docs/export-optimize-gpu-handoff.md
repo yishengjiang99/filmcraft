@@ -187,7 +187,9 @@ Still to do for Phase 2:
 - Disk is tight (bench machine ~17 GB free after deleting iOS simulators; was 2.2 GB): share
   `CARGO_TARGET_DIR=/Users/yishengj/filmcraft/target`, `CARGO_INCREMENTAL=0`, `--release`
   everywhere; a worktree at another path rebuilds every workspace crate, so agents run per-crate
-  gates and the coordinator runs the full `cargo xtask ci` once after merging.
+  gates and the fast-tier `cargo xtask ci` before each push; the full suite runs in the
+  background in Export CI (`.github/workflows/export-ci.yml`, nightly / on demand) and once at
+  phase end. Nothing waits on it.
 - Only one timed benchmark at a time, never while anything compiles; agents do single
   correctness runs only.
 

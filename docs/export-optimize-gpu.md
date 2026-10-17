@@ -17,8 +17,9 @@ always works.
 no `unwrap`/`expect`/`panic!` outside tests, and everything returns `Result`. No `unsafe`
 outside `crates/platform`. Clean-room only: no GPL code, and don't read third-party encoder
 source. ffmpeg is allowed **only** as a test oracle and fixture generator. Use permissive
-dependencies only. Everything is a command and agent-drivable. `cargo xtask ci` passes before
-every commit.
+dependencies only. Everything is a command and agent-drivable. The fast-tier `cargo xtask ci` passes before
+every push. The full suite (`--full`) runs in the background (`.github/workflows/export-ci.yml`:
+nightly and on demand) and at phase end; nothing waits on it.
 
 ---
 
@@ -257,7 +258,8 @@ Every rung must pass before the next one runs; most bugs should be caught on run
 8. node bench-compare.mjs --baseline <previous accepted iteration>
 9. Decide:
      - all gates (§4.2) pass AND target metric improved beyond noise → KEEP: rebuild with
-       wasm-opt, confirm the result once, full PSNR validation, `cargo xtask ci`, commit with
+       wasm-opt, confirm the result once, full PSNR validation, fast-tier `cargo xtask ci`
+       (before pushing: it picks its tests from unpushed commits), commit with
        numbers in the message.
      - gates pass, no measurable gain → keep only if it simplifies code or unlocks the next step; say so.
      - any gate fails → fix, or revert (git checkout) and record why in docs/benchmarks/web-export.md.
@@ -277,7 +279,8 @@ wrong, write down why and ask. When results are noisy (CV > 5% after reruns), do
 win; increase `--runs` or investigate the noise source (thermal, other tabs, power mode).
 
 ### 4.2 Gates (must hold after every kept iteration)
-- `cargo xtask ci` passes before each commit (not each attempt). There are no new
+- The fast-tier `cargo xtask ci` passes before each push (not each attempt; never `--full` on
+  the way: that runs in Export CI, nightly, and once at phase end). There are no new
   `unwrap`/`expect`/`unsafe`.
 - `smoke.mjs` passes (headless correctness).
 - Every exported file passes §2.2. The software path is byte-identical to baseline (at the
@@ -448,7 +451,7 @@ against the iteration-0 baseline:
 | 5 | All outputs valid: ffprobe, `-xerror`, A/V sync ≤ 21 ms, PSNR ≥ 38 dB (min frame ≥ 30 dB), SSIM ≥ 0.97 | validate-export.mjs |
 | 6 | Software path byte-identical to baseline at the baseline preset and thread count; SIMD bit-exact with scalar; any preset/slice change logged with a new reference hash. If Phase 5 ran: software P2 ≥ 1.8× faster at the same preset. If its entry gate skipped it: the gate's evidence is recorded | sha256, unit tests, bench |
 | 7 | Fallbacks pass: `?softenc&cpu`, `?webgl`, `?nothreads`, and a correctness run in Firefox and Safari if available locally | smoke + validate |
-| 8 | `cargo xtask ci` green; docs updated (`docs/web.md` support matrix, `docs/web-optimization-plan.md`, `docs/performance.md`, `docs/benchmarks/web-export.md` with every iteration logged) | CI, review |
+| 8 | `cargo xtask ci --full` green once at the end (Export CI's nightly run counts); fast tier green before every push; docs updated (`docs/web.md` support matrix, `docs/web-optimization-plan.md`, `docs/performance.md`, `docs/benchmarks/web-export.md` with every iteration logged) | CI, review |
 
 When a target is impossible on this machine (for example, no hardware HEVC encoder), say so
 with the env.json evidence, meet it on the paths that exist, and don't fake numbers.
