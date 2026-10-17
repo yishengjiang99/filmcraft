@@ -1521,6 +1521,18 @@ mod lumetri_cpu_parity_tests {
                     ("blacks", fl(-100.0)),
                 ],
             ),
+            // Creative ▸ Look LUT (built-in 3D table), with the basic stage and the vignette
+            (
+                "look_lut",
+                vec![
+                    ("exposure", fl(0.2)),
+                    ("contrast", fl(10.0)),
+                    ("look_lut", ParamValue::Text("builtin:look-teal-orange".into())),
+                    ("look_intensity", fl(70.0)),
+                    ("vignette_amount", fl(-2.0)),
+                ],
+            ),
+            ("look_lut_full", vec![("look_lut", ParamValue::Text("builtin:look-teal-orange".into())), ("look_intensity", fl(100.0))]),
         ];
 
         let (w, h) = (67usize, 41usize);
@@ -1557,6 +1569,41 @@ mod lumetri_cpu_parity_tests {
             }
             eprintln!("{name}: max sample diff vs fn lumetri: {max_diff:.2e}");
         }
+    }
+
+    /// A Look LUT runs on the GPU only as a plain, finite 3D table that resolves; anything else
+    /// (a missing library LUT, a shaper, a broken grid) keeps the effect on the CPU.
+    #[test]
+    fn lumetri_look_lut_on_the_gpu_only_when_it_is_a_plain_table() {
+        use crate::gpufx::gpu_cube;
+        let cx = FxCtx {
+            t: Tick::ZERO,
+            px_scale: 1.0,
+            seconds: 0.0,
+            timecode: "",
+            clip_name: "",
+            project: None,
+            env: None,
+            frame_rate: 24.0,
+            working: filmcraft_color::WorkingSpace::Rec709,
+        };
+        let op = |spec: &str| FxOp::eval(&effect(&[("look_lut", ParamValue::Text(spec.into()))]), &cx, 8, 8).expect("lumetri op");
+        assert!(op("builtin:look-teal-orange").gpu_ok());
+        assert!(!op("lib:not-in-the-project").gpu_ok());
+        let cube = filmcraft_color::Lut3d::identity(5);
+        assert!(gpu_cube(&filmcraft_color::Lut::from_cube(cube.clone())).is_some());
+        let shaped = filmcraft_color::Lut { title: String::new(), shaper: Some(filmcraft_color::Lut1d::identity(16)), cube: Some(cube.clone()) };
+        assert!(gpu_cube(&shaped).is_none());
+        let mut nan = cube.clone();
+        nan.data[3][1] = f32::NAN;
+        assert!(gpu_cube(&filmcraft_color::Lut::from_cube(nan)).is_none());
+        let mut short = cube.clone();
+        short.data.pop();
+        assert!(gpu_cube(&filmcraft_color::Lut::from_cube(short)).is_none());
+        let mut flat = cube.clone();
+        flat.domain_max = flat.domain_min;
+        assert!(gpu_cube(&filmcraft_color::Lut::from_cube(flat)).is_none());
+        assert!(gpu_cube(&filmcraft_color::Lut::from_cube(filmcraft_color::Lut3d::identity(1))).is_none());
     }
 
     /// #719: positive Roundness rounds the Lumetri vignette (it used to be ignored), +100

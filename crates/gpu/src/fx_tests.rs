@@ -303,6 +303,20 @@ fn cases() -> Vec<(&'static str, Vec<(&'static str, ParamValue)>, bool)> {
             ],
             false,
         ),
+        // Creative ▸ Look LUT (a built-in 33³ table): alone, and after the basic stage and vignette
+        ("lumetri", vec![("look_lut", ParamValue::Text("builtin:look-teal-orange".into())), ("look_intensity", fl(100.0))], false),
+        (
+            "lumetri",
+            vec![
+                ("exposure", fl(0.3)),
+                ("contrast", fl(20.0)),
+                ("saturation", fl(110.0)),
+                ("look_lut", ParamValue::Text("builtin:look-teal-orange".into())),
+                ("look_intensity", fl(60.0)),
+                ("vignette_amount", fl(-2.0)),
+            ],
+            false,
+        ),
     ]
 }
 

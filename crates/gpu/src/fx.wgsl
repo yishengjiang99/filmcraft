@@ -19,6 +19,8 @@ struct U {
 @group(0) @binding(2) var dst: texture_storage_2d<rgba32float, write>;
 // Unsharp Mask: the image before blurring.
 @group(0) @binding(3) var aux: texture_2d<f32>;
+// Look LUT: a 3D table, RGBA f32 per entry, red fastest (a 16-byte dummy for other ops).
+@group(0) @binding(4) var<storage, read> lut3: array<vec4<f32>>;
 
 const OP_BRIGHTNESS_CONTRAST: u32 = 1u;
 const OP_PROC_AMP: u32 = 2u;
@@ -50,6 +52,7 @@ const OP_MIRROR: u32 = 28u;
 const OP_OFFSET: u32 = 29u;
 const OP_VIDEO_LIMITER: u32 = 30u;
 const OP_LUMETRI: u32 = 31u;
+const OP_LUT3: u32 = 32u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -441,6 +444,44 @@ fn color_op(op: u32, c: vec3<f32>) -> vec3<f32> {
     }
 }
 
+fn lut_at(r: u32, g: u32, b: u32) -> vec3<f32> {
+    let n = u.i1.x;
+    return lut3[r + g * n + b * n * n].xyz;
+}
+
+// `Lut3d::apply`: tetrahedral interpolation. i1.x = size, p0.xyz = domain min, p1.xyz = max.
+fn lut_tetra(c: vec3<f32>) -> vec3<f32> {
+    let n = u.i1.x;
+    let m = f32(n - 1u);
+    let t = clamp((c - u.p0.xyz) / (u.p1.xyz - u.p0.xyz), vec3(0.0), vec3(1.0)) * m;
+    let i = min(vec3<u32>(t), vec3(n - 2u));
+    let f = t - vec3<f32>(i);
+    let fr = f.x;
+    let fg = f.y;
+    let fb = f.z;
+    let c000 = lut_at(i.x, i.y, i.z);
+    let c111 = lut_at(i.x + 1u, i.y + 1u, i.z + 1u);
+    var ca: vec3<f32>;
+    var cb: vec3<f32>;
+    var w: vec4<f32>;
+    if fr > fg {
+        if fg > fb {
+            ca = lut_at(i.x + 1u, i.y, i.z); cb = lut_at(i.x + 1u, i.y + 1u, i.z); w = vec4(1.0 - fr, fr - fg, fg - fb, fb);
+        } else if fr > fb {
+            ca = lut_at(i.x + 1u, i.y, i.z); cb = lut_at(i.x + 1u, i.y, i.z + 1u); w = vec4(1.0 - fr, fr - fb, fb - fg, fg);
+        } else {
+            ca = lut_at(i.x, i.y, i.z + 1u); cb = lut_at(i.x + 1u, i.y, i.z + 1u); w = vec4(1.0 - fb, fb - fr, fr - fg, fg);
+        }
+    } else if fb > fg {
+        ca = lut_at(i.x, i.y, i.z + 1u); cb = lut_at(i.x, i.y + 1u, i.z + 1u); w = vec4(1.0 - fb, fb - fg, fg - fr, fr);
+    } else if fb > fr {
+        ca = lut_at(i.x, i.y + 1u, i.z); cb = lut_at(i.x, i.y + 1u, i.z + 1u); w = vec4(1.0 - fg, fg - fb, fb - fr, fr);
+    } else {
+        ca = lut_at(i.x, i.y + 1u, i.z); cb = lut_at(i.x + 1u, i.y + 1u, i.z); w = vec4(1.0 - fg, fg - fr, fr - fb, fb);
+    }
+    return w.x * c000 + w.y * ca + w.z * cb + w.w * c111;
+}
+
 fn lumetri_op(c: vec3<f32>, p: vec2<i32>) -> vec3<f32> {
     let s = size();
     let creative_on = u.i1.x != 0u;
@@ -714,6 +755,18 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
             let c = o.rgb / a;
             let res = lumetri_op(c, p);
             return vec4(res * a, a);
+        }
+        case OP_LUT3: {
+            // Lumetri Look LUT: encoded value clamped to 0…1 through the table, mixed by
+            // intensity (p0.w) with the unclamped one, decoded
+            let o = ld(p);
+            let a = o.a;
+            if a <= 1e-6 {
+                return o;
+            }
+            let v = enc(o.rgb / a);
+            let lk = lut_tetra(clamp(v, vec3(0.0), vec3(1.0)));
+            return vec4(dec(v + (lk - v) * u.p0.w) * a, a);
         }
         default: {
             let o = ld(p);

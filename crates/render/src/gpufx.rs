@@ -195,8 +195,29 @@ pub enum FxOp {
         vround: f32,
         vfeather: f32,
         aspect: f32,
+        /// Creative ▸ Look LUT and its intensity (0…1), applied after the rest (as
+        /// `effects::lumetri_advanced` does). Only a plain 3D table runs on the GPU.
+        look: Option<(std::sync::Arc<filmcraft_color::Lut>, f32)>,
         gpu_capable: bool,
     },
+}
+
+/// Largest 3D LUT grid the GPU effect stage takes (a 65³ table is 4.4 MB as RGBA f32).
+pub const GPU_LUT_MAX: usize = 65;
+
+/// The 3D table of `lut` when the GPU effect stage can apply it: no 1D shaper, a grid of 2 to
+/// [`GPU_LUT_MAX`] entries per side whose data is all there and finite, a usable domain.
+pub fn gpu_cube(lut: &filmcraft_color::Lut) -> Option<&filmcraft_color::Lut3d> {
+    if lut.shaper.is_some() {
+        return None;
+    }
+    let c = lut.cube.as_ref()?;
+    let n = c.size;
+    let ok = (2..=GPU_LUT_MAX).contains(&n)
+        && n.checked_pow(3) == Some(c.data.len())
+        && c.data.iter().all(|v| v.iter().all(|x| x.is_finite()))
+        && (0..3).all(|k| c.domain_min[k].is_finite() && c.domain_max[k].is_finite() && c.domain_max[k] > c.domain_min[k]);
+    ok.then_some(c)
 }
 
 /// Effect ids [`FxOp::eval`] understands (the GPU-capable standard effects).
@@ -529,7 +550,18 @@ impl FxOp {
 
                 let hsl_on = b(e, "hsl_on");
 
-                let gpu_capable = !is_hdr && !has_input_lut && !has_look_lut && look == 0 && sharpen.abs() <= 1e-3 && !has_curves && !has_wheels && !hsl_on;
+                // a Look LUT that resolves to a plain 3D table runs on the GPU too (one that does
+                // not resolve falls back to the procedural Look menu on the CPU)
+                let look_lut = if has_look_lut { crate::luts::resolve(cx.project, text(e, "look_lut")) } else { None };
+                let look_gpu = look_lut.filter(|l| gpu_cube(l).is_some()).map(|l| (l, f(e, "look_intensity", cx) / 100.0));
+                let gpu_capable = !is_hdr
+                    && !has_input_lut
+                    && (!has_look_lut || look_gpu.is_some())
+                    && look == 0
+                    && sharpen.abs() <= 1e-3
+                    && !has_curves
+                    && !has_wheels
+                    && !hsl_on;
 
                 let bf = |id: &str| if basic_on { f(e, id, cx) } else { 0.0 };
                 let temp = bf("temperature") / 100.0;
@@ -572,6 +604,7 @@ impl FxOp {
                     vround,
                     vfeather,
                     aspect,
+                    look: look_gpu,
                     gpu_capable,
                 }
             }
@@ -620,8 +653,11 @@ impl FxOp {
             FxOp::AlphaAdjust { opacity, .. } => opacity.is_finite(),
             FxOp::Vignette { amount, midpoint, roundness, feather, target } => fin(&[*amount, *midpoint, *roundness, *feather]) && fin(target),
             FxOp::VideoLimiter { max, comp, axis, warning_color, .. } => *axis <= 3 && max.is_finite() && comp.is_finite() && fin(warning_color),
-            FxOp::Lumetri { gains, exposure, contrast, hl, sh, wh, bl, sat, faded, vib, st, ht, va, vmid, vround, vfeather, aspect, gpu_capable, .. } => {
+            FxOp::Lumetri {
+                gains, exposure, contrast, hl, sh, wh, bl, sat, faded, vib, st, ht, va, vmid, vround, vfeather, aspect, look, gpu_capable, ..
+            } => {
                 *gpu_capable
+                    && look.as_ref().is_none_or(|(l, k)| gpu_cube(l).is_some() && k.is_finite())
                     && fin(gains)
                     && fin(&[*exposure, *contrast, *hl, *sh, *wh, *bl, *sat, *faded, *vib])
                     && fin(st)
@@ -942,6 +978,7 @@ impl FxOp {
                 vround,
                 vfeather,
                 aspect,
+                look,
                 ..
             } => {
                 let gains = *gains;
@@ -1003,6 +1040,16 @@ impl FxOp {
                     }
                     dec(v)
                 });
+                // Creative ▸ Look LUT: a pass of its own over the decoded result, exactly as
+                // `effects::lumetri_advanced` (SDR: the LUT reads the encoded value clamped to 0…1)
+                if let Some((l, k)) = look {
+                    let k = *k;
+                    img.map_rgb(|c, _, _| {
+                        let v = enc(c);
+                        let lk = l.apply(v.map(|q| q.clamp(0.0, 1.0)));
+                        dec([v[0] + (lk[0] - v[0]) * k, v[1] + (lk[1] - v[1]) * k, v[2] + (lk[2] - v[2]) * k])
+                    });
+                }
             }
         }
     }
