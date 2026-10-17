@@ -9,7 +9,8 @@ for a in "$@"; do case "$a" in --threads) build_args+=(--threads);; --skip-build
 cd "$(dirname "$0")/.."
 [[ $skip == 1 ]] || cargo xtask web "${build_args[@]}"
 test -s target/web/dist/index.html && test -s target/web/dist/filmcraft_web_bg.wasm
-rsync -a --delete --chmod=D755,F644 target/web/dist/ "$HOST:$DIR.new/"
-ssh "$HOST" "set -e; rm -rf '$DIR.prev'; if [ -d '$DIR' ]; then mv '$DIR' '$DIR.prev'; fi; mv '$DIR.new' '$DIR'"
+# (permissions set on the server: macOS's openrsync has no --chmod)
+rsync -a --delete target/web/dist/ "$HOST:$DIR.new/"
+ssh "$HOST" "set -e; find '$DIR.new' -type d -exec chmod 755 {} +; find '$DIR.new' -type f -exec chmod 644 {} +; if [ -d '$DIR' ]; then chown -R --reference='$DIR' '$DIR.new'; fi; rm -rf '$DIR.prev'; if [ -d '$DIR' ]; then mv '$DIR' '$DIR.prev'; fi; mv '$DIR.new' '$DIR'"
 code=$(curl -s -o /dev/null -w '%{http_code}' https://grepawk.com/filmcraft/ || true)
 echo "https://grepawk.com/filmcraft/ -> $code"; [[ "$code" == 200 ]]
