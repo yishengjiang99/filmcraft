@@ -13,9 +13,9 @@ cites a `target/web-bench/results.jsonl` line (label + git sha) on the bench mac
 | §2.4 baseline | short projects (P1s/P2s/P3s) + full P1 measured; full P2/P3/P4 not run (see "Baseline") |
 | Phase 1 WebCodecs hardware encoder | done, committed (`bd13e6c8`); measured on P1s/P2s (below) |
 | Phase 3 streaming output (OPFS / Blob) | done, committed (`bd13e6c8`); OPFS + Blob sinks validated; memory effect not yet separated from Phase 1 (below) |
-| Phase 2 GPU compositing for export | designed, not started (below) |
+| Phase 2 GPU compositing for export | **in progress** on branch `worktree-agent-a88eed9bd193a763f` (worktree `.claude/worktrees/agent-a88eed9bd193a763f`): 1 commit + uncommitted work; P2s works on the GPU, P3s blocked on wasm memory (see "Phase 2 in progress") |
 | Phase 4 off the main thread | not started; design notes below |
-| Phase 5 simd128 in `h264enc` | done (branch of the Phase 5 agent): software encoder 1.9x faster on wasm (node), bytes unchanged; Chrome export not yet measured |
+| Phase 5 simd128 in `h264enc` | done, on `main` (`5a5e4e79`..`64348228`): software encoder 1.9x faster on wasm (node), 1.75x native, bytes unchanged; Chrome export + P1s sha check not yet run |
 
 Also done on the way: `cargo xtask ci` fast test tier (`--full` for everything), OPFS writes in
 the threaded build fixed (recovery snapshots were never saved), rustfmt drift on `main`.
@@ -116,6 +116,52 @@ matroska changes or `Cargo.lock` changes (which forces the full suite).
 - The baseline uses `--legacy` (no `encoder`/`sink` params, which did not exist yet); later runs of
   the software path pass `--encoder software --compositor cpu` and must stay byte-identical.
 
+## Phase 2 in progress (state at handoff, 2026-10-16 ~17:00)
+
+Work is on branch `worktree-agent-a88eed9bd193a763f` (git worktree
+`.claude/worktrees/agent-a88eed9bd193a763f`, based on `19b98cef`; `main` has since moved on with
+Phase 5 and an xtask fix, so rebase before merging). The agent stopped at a usage limit.
+
+- **Committed** `e78fa927` "export: asynchronous frame renderers (Ready / Pending / Declined),
+  partial batches, prefetch" (crates/export).
+- **Uncommitted in the worktree** (check `git -C <worktree> status`): `crates/gpu/src/async_export.rs`
+  (async read-back ring on the existing device), `apps/filmcraft-web/src/gpu_export.rs` (frame-renderer
+  factory on eframe's WebGPU device), edits to crates/gpu (lib.rs, export_renderer.rs, Cargo.toml),
+  crates/export/src/lib.rs, crates/engine/src/export_tools.rs, apps/filmcraft-web (api.rs, lib.rs,
+  Cargo.toml, tests/export-bench.mjs), docs/web.md, Cargo.lock.
+- **Measured (single indicative run, not a benchmark):** P2s on the GPU 10.7 s (phase 1: 133.8 s,
+  baseline 168.2 s), 360/360 frames on the GPU, Y-PSNR 46.38 dB (min 43.18), SSIM 0.985.
+- **Bug found and fixed in the work:** on WebGPU the compositor's effect stage was always disabled
+  (an error-scope future polled once, `Pending` treated as failure), so Lumetri / blur / etc. ran
+  on the CPU even in previews.
+- **Blocker: P3s (4K)** traps (`RuntimeError: unreachable`, allocation failure) in the `mt` build at
+  ~1.95–2.14 GB of wasm heap: `mt` is linked with `--max-memory=2147483648`; the phase-1 CPU path
+  already peaked at 1.93 GB (1 GiB decode `FRAME_BUDGET` + 4K f32 intermediates). Approved
+  fixes (coordinator decision): **(b) first** — cap the decoded-frame cache (and other playback-sized
+  caches, e.g. WebCodecs' 40-frame per-source cache) while a web export runs, restore it when the
+  export ends however it ends, report wasm peaks before/after; **(a)** raise the `mt` link max to
+  4 GiB (`--max-memory=4294967296`) in xtask, confirming the `mt` build still instantiates and a
+  failed threaded start still falls back to `st` (index.html), noted in docs/web.md. The agent was
+  also trimming its own path (upload cache 24 → 8, banded f16 conversion instead of a 66 MB copy,
+  30 s read-back timeout).
+- **Harness bug to fix:** `export-bench.mjs` hangs forever when the page traps mid-export (ignores
+  `--timeout-min`): wrap each `page.js`/`send` in the poll loop with a timeout and fail the run on
+  `Inspector.targetCrashed` or a `RuntimeError`/`unreachable` console line.
+- **Still to do for Phase 2:** the above, then gates (per-crate tests, clippy incl. wasm, fmt, smoke),
+  commit, then the coordinator runs the timed matrix (`--compositor gpu` vs `cpu`, P1s/P2s/P3s) on a
+  quiet machine, merges to `main`, pushes, and logs the iteration in `docs/benchmarks/web-export.md`.
+  `export-bench --compositor gpu|cpu` sends `gpuRendering: auto|off` in that work.
+
+### Working rules that held up
+- Agents work in git worktrees and commit small steps on their branch; the coordinator merges to
+  `main` (fast-forward / rebase) after a full gate run and pushes.
+- Disk is tight (bench machine ~17 GB free after deleting iOS simulators; was 2.2 GB): share
+  `CARGO_TARGET_DIR=/Users/yishengj/filmcraft/target`, `CARGO_INCREMENTAL=0`, `--release`
+  everywhere; a worktree at another path rebuilds every workspace crate, so agents run per-crate
+  gates and the coordinator runs the full `cargo xtask ci` once after merging.
+- Only one timed benchmark at a time, never while anything compiles; agents do single
+  correctness runs only.
+
 ## Next steps (in order)
 
 1. `bench-compare.mjs` pairs results by exact config name, so baseline (`software-cpu-auto`) and
@@ -126,7 +172,7 @@ matroska changes or `Cargo.lock` changes (which forces the full suite).
    (`memoryDetail`): the 1 GiB `FRAME_BUDGET` and WebCodecs' 40-frame per-source cache are sized
    for playback, not for a one-pass export; P4 (60 min) cannot finish without streaming (5.4 GB
    output > 4 GiB wasm).
-4. Phase 2 (the big one for P2/P3): `ExportRenderer::render` reads back synchronously, which
+4. Phase 2: finish per "Phase 2 in progress" above. Original design note: `ExportRenderer::render` reads back synchronously, which
    cannot work on the browser's main thread. Needed: an asynchronous render path in the stepped
    exporter (submit frame N, `mapAsync`, collect on a later step, same `Step::Pending` pattern as
    the encoder), using eframe's WebGPU device; then the zero-copy variant (render the output
