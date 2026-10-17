@@ -1,0 +1,146 @@
+# Export CI: the crates of the web export work (docs/export-optimize-gpu.md) built and tested off
+# the critical path. Agents run the touched crates' tests and the fast-tier `cargo xtask ci`
+# before each push; this workflow runs the rest in the background so nobody waits on it:
+#   - export: fmt, clippy and the tests of the export pipeline's crates (native, GPU tests on
+#     Mesa's software Vulkan, ffmpeg as the test oracle), and the layer check.
+#   - wasm: the L0–L4 wasm check and clippy of the web app for wasm32 (the export path that runs
+#     in the browser: WebCodecs, WebGPU export, streaming sinks).
+#   - full: `cargo xtask ci --full`, nightly and on demand only (it is the slow tier).
+# Nothing is uploaded and no secrets are used.
+name: Export CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/export/**
+      - crates/gpu/**
+      - crates/render/**
+      - crates/codecs/**
+      - crates/media/**
+      - crates/h264enc/**
+      - crates/engine/**
+      - crates/isobmff/**
+      - crates/frame/**
+      - crates/color/**
+      - apps/filmcraft-web/**
+      - xtask/**
+      - Cargo.lock
+      - .github/workflows/export-ci.yml
+  schedule:
+    - cron: "23 7 * * *" # nightly: drift in dependencies and runner images shows up within a day
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Also run the whole suite (cargo xtask ci --full)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: export-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # ffmpeg / ffprobe run only as test oracles (never linked or shipped)
+  FILMCRAFT_FFMPEG: /usr/bin/ffmpeg
+  FILMCRAFT_FFPROBE: /usr/bin/ffprobe
+  # wgpu on Mesa's lavapipe: the GPU parity tests run instead of skipping for want of an adapter
+  WGPU_BACKEND: vulkan
+
+jobs:
+  export:
+    name: Export crates (native)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Tools (ffmpeg oracle, software Vulkan)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg mesa-vulkan-drivers libvulkan1 pkg-config
+          ffmpeg -version | head -1
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustc --version
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: export-native-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: export-native-${{ runner.os }}-
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy (export crates)
+        run: >
+          cargo clippy --all-targets
+          -p filmcraft-export -p filmcraft-gpu -p filmcraft-render -p filmcraft-codecs -p filmcraft-media
+          -p filmcraft-h264enc -p filmcraft-engine -p filmcraft-isobmff -p filmcraft-frame -p filmcraft-color
+          -- -D warnings
+      - name: Tests (export crates)
+        run: >
+          cargo test --no-fail-fast
+          -p filmcraft-export -p filmcraft-gpu -p filmcraft-render -p filmcraft-codecs -p filmcraft-media
+          -p filmcraft-h264enc -p filmcraft-engine -p filmcraft-isobmff -p filmcraft-frame -p filmcraft-color
+      - name: Layering
+        run: cargo xtask layers
+
+  wasm:
+    name: Web export (wasm32)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: export-wasm-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: export-wasm-${{ runner.os }}-
+      - name: L0–L4 crates build for wasm32
+        run: cargo xtask wasm
+      - name: Clippy (web app, wasm32)
+        run: cargo clippy -p filmcraft-web --target wasm32-unknown-unknown -- -D warnings
+
+  full:
+    name: Full suite (xtask ci --full)
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.full)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Tools and UI libraries
+        # winit/wgpu (X11, Wayland, Vulkan), the file dialogs (GTK 3), fonts, audio (ALSA)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg mesa-vulkan-drivers libvulkan1 pkg-config \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxcb1-dev \
+            libgtk-3-dev libfontconfig1-dev libfreetype-dev libasound2-dev
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: export-full-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: export-full-${{ runner.os }}-
+      - name: cargo xtask ci --full
+        run: cargo xtask ci --full
