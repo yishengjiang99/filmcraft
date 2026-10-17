@@ -2,8 +2,6 @@
 //! arrives on later steps, an encoder that is not ready, a flush that completes later, errors
 //! reported meanwhile, and `require_hardware`.
 
-use std::sync::atomic::AtomicU32;
-
 use super::*;
 use crate::tests::project;
 
@@ -13,9 +11,6 @@ fn tmp(name: &str) -> String {
     d.join(name).to_string_lossy().to_string()
 }
 
-/// How the fake asynchronous encoder misbehaves.
-static FAIL_AFTER: AtomicU32 = AtomicU32::new(u32::MAX);
-
 /// Wraps the built-in MJPEG encoder: packets are held back and released over later polls, the
 /// encoder is "busy" every third time it is asked, the flush completes three polls later.
 struct LaggingEncoder {
@@ -24,6 +19,9 @@ struct LaggingEncoder {
     asked: u32,
     flushing: Option<u32>,
     encoded: u32,
+    /// `ready` reports an error once this many pictures were encoded (per encoder, not a
+    /// process-wide switch: the tests run in parallel).
+    fail_after: u32,
 }
 
 impl LaggingEncoder {
@@ -51,7 +49,7 @@ impl VideoEncoder for LaggingEncoder {
         Ok(self.release(self.held.len().saturating_sub(2)))
     }
     fn ready(&mut self) -> Result<bool> {
-        if self.encoded >= FAIL_AFTER.load(Ordering::SeqCst) {
+        if self.encoded >= self.fail_after {
             return Err(ExportError::Encode("the browser's hardware encoder failed (test)".into()));
         }
         self.asked += 1;
@@ -74,13 +72,15 @@ impl VideoEncoder for LaggingEncoder {
     }
 }
 
-/// Takes MJPEG exports to `…lagging…` paths only, so other tests in this process are unaffected.
+/// Takes MJPEG exports to `…lagging…` paths only, so other tests in this process are unaffected;
+/// `…lagging-fail…` paths fail after five pictures.
 fn lagging_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Option<Result<Box<dyn VideoEncoder>>> {
     if format != Format::Mjpeg || !s.path.contains("lagging") {
         return None;
     }
     let inner = mjpeg_factory(format, w, h, rate, s)?.ok()?;
-    Some(Ok(Box::new(LaggingEncoder { inner, held: Default::default(), asked: 0, flushing: None, encoded: 0 })))
+    let fail_after = if s.path.contains("lagging-fail") { 5 } else { u32::MAX };
+    Some(Ok(Box::new(LaggingEncoder { inner, held: Default::default(), asked: 0, flushing: None, encoded: 0, fail_after })))
 }
 
 fn run_stepped(s: &ExportSettings) -> Result<(Vec<u8>, u32)> {
@@ -126,10 +126,8 @@ fn samples(file: &[u8]) -> Vec<Vec<(Vec<u8>, u32, i64, bool)>> {
 #[test]
 fn an_encoder_error_reported_later_stops_the_export() {
     register_encoder(lagging_factory);
-    FAIL_AFTER.store(5, Ordering::SeqCst);
     let s = ExportSettings { format: Format::Mjpeg, path: tmp("lagging-fail.mov"), ..Default::default() };
     let r = run_stepped(&s);
-    FAIL_AFTER.store(u32::MAX, Ordering::SeqCst);
     match r {
         Err(ExportError::Encode(m)) => assert!(m.contains("hardware encoder failed"), "{m}"),
         other => panic!("expected the encoder's error, got {:?}", other.map(|(_, p)| p)),

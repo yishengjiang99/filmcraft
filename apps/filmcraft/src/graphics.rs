@@ -527,7 +527,10 @@ mod tests {
         let WgpuSetup::CreateNew(eframe_default) = NativeOptions::default().wgpu_options.wgpu_setup else {
             panic!("default native options must create a wgpu instance");
         };
-        assert!(eframe_default.instance_descriptor.backends.contains(Backends::GL));
+        // (unless `WGPU_BACKEND` picks the backends, as in CI on lavapipe)
+        if std::env::var_os("WGPU_BACKEND").is_none() {
+            assert!(eframe_default.instance_descriptor.backends.contains(Backends::GL));
+        }
         let (backends, selector) = configured(Mode::Default, None, true);
         assert_eq!(backends, Backends::PRIMARY);
         assert!(!backends.contains(Backends::GL));
