@@ -387,7 +387,7 @@ fn copy_for_ingest(s: &mut Session, item: ItemId, path: &str, dir: &Path) -> Res
     let mut input = std::fs::File::open(source).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     std::fs::create_dir_all(dir).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;
     let mut number = 1u64;
-    let (out, mut output) = loop {
+    let (out, output) = loop {
         let mut next = if number == 1 { name.to_os_string() } else { source.file_stem().unwrap_or(name).to_os_string() };
         if number != 1 {
             next.push(format!(" {number}"));
@@ -405,8 +405,11 @@ fn copy_for_ingest(s: &mut Session, item: ItemId, path: &str, dir: &Path) -> Res
             Err(e) => return Err(EngineError::Other(format!("{}: {e}", out.display()))),
         }
     };
-    let copied = std::io::copy(&mut input, &mut output).and_then(|_| output.set_permissions(input.metadata()?.permissions()));
-    drop(output);
+    // the copy is closed before its identity is read (the block drops it)
+    let copied = {
+        let mut output = output;
+        std::io::copy(&mut input, &mut output).and_then(|_| output.set_permissions(input.metadata()?.permissions()))
+    };
     let out_s = out.to_string_lossy().into_owned();
     let linked = copied.map_err(|e| EngineError::Other(format!("copying {path}: {e}"))).and_then(|_| {
         let a = crate::relink::identity_of(&*s.services, path).map_err(|e| EngineError::Other(e.to_string()))?;
