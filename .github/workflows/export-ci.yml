@@ -37,7 +37,9 @@ on:
         default: false
 
 concurrency:
-  group: export-ci-${{ github.ref }}
+  # per event type: a push replaces an older push run, but never cancels the scheduled or a
+  # dispatched full suite (~3 h) that happens to be running on the same branch
+  group: export-ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions:
