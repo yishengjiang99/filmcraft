@@ -132,7 +132,8 @@ For **each run**:
 4. Build the project through the API, wait for `filmcraft.execute("jobs.list")` to show no
    pending import/indexing jobs, then start
    `filmcraft.execute("file.exportMedia", {..., encoder, sink})` and poll the job to
-   completion (timeout 10 min; 90 min for P4).
+   completion (timeout 3× the configuration's baseline wall time, 10 min where there is none
+   yet, 90 min for P4; a stall watchdog and first-error abort fail it sooner, §4.1).
 5. During export, collect:
    - `wallMs` and `exportFps` (frames / wall seconds), plus `realtimeFactor`
      (media duration / wall time).
@@ -176,13 +177,21 @@ For every exported file:
 - `ffmpeg -v error -xerror -i out -f null -`: zero decode errors.
 - **A/V sync**: the fixtures carry a beep on a white flash every 5 s. Detect both in the
   output (`ffmpeg` `astats`/`silencedetect` and `blackdetect`/`signalstats`) and require
-  |offset| ≤ 1 audio frame (~21 ms).
+  |offset| ≤ 1 audio frame (~21 ms). Every audio encoder path must signal its priming in the
+  edit list (`edts`/`elst`): AAC's 1024-sample encoder delay alone is 21.3 ms at 48 kHz. (Today's
+  web exports encode audio with our own AAC encoder, which does; measured 0.02 ms in every run.
+  A WebCodecs `AudioEncoder` path must do the same; the tolerance does not change for it.)
 - **Picture quality**: compare against a **reference render** of the same project, made
   once per project with the current software path (`filmcraft-cli` export to lossless or
   PNG frames) and cached in `target/web-bench/ref/`. Compute PSNR/SSIM with ffmpeg
   (`-lavfi psnr`/`ssim`). Thresholds: hardware/GPU paths at equal bitrate ≥ 38 dB luma
   PSNR, SSIM ≥ 0.97, and **no single frame below 30 dB** (catches colour-matrix, range or
-  frame-order bugs). Save the worst frame side-by-side as a PNG when a check fails.
+  frame-order bugs). Save the worst frame side-by-side as a PNG when a check fails. Measured
+  on Chrome / M4 Pro hardware H.264 at the pinned bitrates: 47–51 dB, so 38 dB has margin; if
+  another encoder lands within ~3 dB of it, calibrate that encoder's threshold from its
+  iteration-0 run (and say so) rather than chase it, keeping the 30 dB per-frame minimum as
+  the bug-catcher. Order the checks cheapest first (metadata, decode, A/V sync, PSNR); the quick
+  loop computes PSNR on sampled frames, keep candidates on every frame.
 - **Determinism**: the software encoder + CPU compositor path must produce a
   **byte-identical** file across runs and versus the pre-change baseline (sha256).
 - Our own decoder must also decode the file (round trip through `filmcraft.importUrl`).
@@ -224,21 +233,43 @@ with the baseline numbers, as the first PR.
 
 ## 4. The loop
 
-### 4.1 Each iteration
+### 4.1 Each iteration: a ladder, cheapest check first
+Every rung must pass before the next one runs; most bugs should be caught on rungs 1–2.
 ```
 1. Pick ONE change from the plan (§5). State the hypothesis + expected metric movement.
 2. Implement it behind a flag/feature detection; keep the fallback path untouched.
-3. cargo clippy / cargo test for touched crates (fast gate).
-4. cargo xtask web  (release build)  — restart the --serve process if needed.
-5. Correctness: node export-bench.mjs --runs 1 --warmup 0 → validate-export.mjs. Fix before going on.
-6. Performance: quick-loop bench (--runs 3, warmup 1).
-7. node bench-compare.mjs --baseline <previous accepted iteration>
-8. Decide:
-     - all gates (§4.2) pass AND target metric improved beyond noise → KEEP: commit with numbers in the message.
+3. Native tests (seconds): cargo clippy / cargo test for the touched crates. Logic that does
+   not need a browser is tested natively: WGSL kernels against their CPU versions on wgpu
+   (Metal/Vulkan), the chunk queue, reserved `moov`, fMP4 fragments, cache policies. Stop here
+   on any failure.
+4. Build without wasm-opt for rungs 5–6 (`cargo xtask web --threads --no-opt`: release, no
+   wasm-opt); restart the --serve process if needed.
+5. Smoke export (~30 s): a 60-frame slice of P2 (`--project P2x`), then metadata → `-xerror`
+   decode → A/V sync (cheapest first). Catches muxing, colour and leak bugs before any long run.
+   The fallbacks (`?softenc&cpu`, `?webgl`) get this smoke every iteration, their full run only
+   at phase end.
+6. Correctness: export-bench --runs 1 --warmup 0 --validate on the target project(s), PSNR on
+   sampled frames (every 10th + the flash frames). Fix before going on.
+7. Performance (only if 3–6 pass): A/B interleaved bench, baseline and candidate builds served
+   on two ports and run alternately (thermal / power drift then hits both). Stop early: a first
+   measured run worse than the baseline beyond the noise band rejects; a clearly better one is
+   confirmed with 2 more.
+8. node bench-compare.mjs --baseline <previous accepted iteration>
+9. Decide:
+     - all gates (§4.2) pass AND target metric improved beyond noise → KEEP: rebuild with
+       wasm-opt, confirm the result once, full PSNR validation, `cargo xtask ci`, commit with
+       numbers in the message.
      - gates pass, no measurable gain → keep only if it simplifies code or unlocks the next step; say so.
      - any gate fails → fix, or revert (git checkout) and record why in docs/benchmarks/web-export.md.
-9. Log the iteration: label, hypothesis, result, decision (one row).
+10. Log the iteration: label, hypothesis, result, decision (one row).
 ```
+
+**Abort early, don't wait for timeouts.** The harness fails a run on the first
+`Runtime.exceptionThrown`, console error, WebGPU validation error, wasm trap or renderer crash,
+and when the export's frame count does not move for `--stall-s` seconds (default 15; 60 for
+configurations whose baseline frame takes over 3 s, e.g. 4K on the CPU compositor). The project
+timeout is 3× the configuration's baseline wall time, not a flat 10 minutes. A stalled run stores
+the exporter and decoder state (`runs.json` `stall`, `lastSamples`).
 
 Limits: at most **3 attempts** on one hypothesis before moving on and noting it as blocked.
 Never change a test threshold, fixture or reference to make a run pass. If a threshold looks
@@ -246,16 +277,18 @@ wrong, write down why and ask. When results are noisy (CV > 5% after reruns), do
 win; increase `--runs` or investigate the noise source (thermal, other tabs, power mode).
 
 ### 4.2 Gates (must hold after every kept iteration)
-- `cargo xtask ci` passes. There are no new `unwrap`/`expect`/`unsafe`.
+- `cargo xtask ci` passes before each commit (not each attempt). There are no new
+  `unwrap`/`expect`/`unsafe`.
 - `smoke.mjs` passes (headless correctness).
 - Every exported file passes §2.2. The software path is byte-identical to baseline (at the
   baseline preset and thread count; see Phase 5 for the one sanctioned exception).
 - Zero console panics, uncaught rejections, or WebGPU validation errors. Zero leaked
   `VideoFrame`s or GPU buffers after export.
-- No regression beyond noise on any **non-target** metric: more than +5% wall time, more
-  than +10% UI p95, or more than +10% peak memory.
-- Fallbacks still work: rerun the quick loop with `?softenc&cpu` and with `?webgl`. Export
-  must still succeed.
+- No regression beyond noise on any **non-target** metric: more than +max(5%, 2×MAD) wall
+  time, more than +max(10%, 2×MAD) UI p95, or more than +10% peak memory (a flat +5% sits
+  inside the 5% CV noise band and fails at random).
+- Fallbacks still work: the `?softenc&cpu` and `?webgl` smoke export (§4.1 step 5) passes every
+  iteration; their full quick loop runs at phase end.
 
 ---
 
