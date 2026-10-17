@@ -58,6 +58,8 @@ const LEAN_CACHE_FRAMES: usize = LOOKAHEAD + 8;
 /// export waiting for it and a scrubbed monitor on the same source evicted each other's frames
 /// and re-decoded them from the key frame forever.
 const PIN_MS: f64 = 2000.0;
+/// Asks whose frames (and the decoder's run-ahead after them) are pinned: the newest ones.
+const PINNED_ASKS: usize = 4;
 /// Pinned frames kept beyond the cache size at most.
 const MAX_PINNED: usize = 32;
 /// Chunks allowed in the decoder's queue before feeding pauses.
@@ -572,8 +574,12 @@ impl WcSource {
         let keep = filmcraft_media::lean::cap(CACHE_FRAMES, LEAN_CACHE_FRAMES);
         let now = now_ms();
         c.asked.retain(|_, at| now - *at < PIN_MS);
-        let asked = &c.asked;
-        filmcraft_media::cache::evict_far(&mut c.frames, keep, want, MAX_PINNED, |p| asked.contains_key(&p));
+        // the newest asks (an export's current frame, the monitor's) and what the decoder ran
+        // ahead of them with (the next frames asked); older asks were served already
+        let mut newest: Vec<(f64, i64)> = c.asked.iter().map(|(p, at)| (*at, *p)).collect();
+        newest.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let pins = filmcraft_media::cache::run_ahead_pins(&c.frames, newest.iter().take(PINNED_ASKS).map(|(_, p)| *p), LOOKAHEAD);
+        filmcraft_media::cache::evict_far(&mut c.frames, keep, want, MAX_PINNED, |p| pins.contains(&p));
         // the session's own frame came out: other requests may restart it now
         SESSIONS.with(|ss| {
             if let Some(s) = ss.borrow_mut().get_mut(&self.id)

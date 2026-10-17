@@ -129,8 +129,41 @@ pub fn evict_far<T>(frames: &mut std::collections::BTreeMap<i64, T>, keep: usize
     }
 }
 
+/// The cached frames to pin for [`evict_far`]: each recently asked frame and the `run_ahead`
+/// frames cached after it. A decoder runs ahead of its request and a one-pass reader (an export)
+/// asks for those next; pinning only what was asked let another requester on the same source
+/// (the scrubbed monitor) evict them, and the export then restarted the decoder at the key frame
+/// for nearly every frame.
+pub fn run_ahead_pins<T>(
+    frames: &std::collections::BTreeMap<i64, T>,
+    asked: impl IntoIterator<Item = i64>,
+    run_ahead: usize,
+) -> std::collections::HashSet<i64> {
+    let mut pins = std::collections::HashSet::new();
+    for a in asked {
+        pins.extend(frames.range(a..).take(run_ahead.saturating_add(1)).map(|(k, _)| *k));
+    }
+    pins
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn run_ahead_of_an_asked_frame_survives_another_requester() {
+        use std::collections::BTreeMap;
+        // the export asked for 10 (the decoder output up to 20); the monitor now wants 100
+        let mut f: BTreeMap<i64, ()> = (10..=20).chain(95..=105).map(|k| (k, ())).collect();
+        let pins = super::run_ahead_pins(&f, [10, 100], 8);
+        assert!((10..=18).all(|k| pins.contains(&k)) && !pins.contains(&19));
+        assert!((100..=105).all(|k| pins.contains(&k)) && !pins.contains(&95));
+        super::evict_far(&mut f, 16, 100, 32, |k| pins.contains(&k));
+        assert_eq!(f.len(), 16);
+        assert!((10..=18).all(|k| f.contains_key(&k)), "the export's next frames stayed: {:?}", f.keys().collect::<Vec<_>>());
+        // nothing asked: nothing pinned; hostile run-ahead does not overflow
+        assert!(super::run_ahead_pins(&f, [], 8).is_empty());
+        assert_eq!(super::run_ahead_pins(&f, [i64::MAX], usize::MAX).len(), 0);
+    }
+
     #[test]
     fn evict_far_keeps_recently_asked_frames() {
         use std::collections::BTreeMap;
