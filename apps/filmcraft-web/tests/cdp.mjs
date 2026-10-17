@@ -95,6 +95,8 @@ async function connect(wsUrl) {
     waiting.clear();
   };
   const send = (method, params = {}, sessionId) => {
+    // a closed connection answers nothing: fail now instead of leaving the caller waiting
+    if (ws.readyState !== WebSocket.OPEN) return Promise.reject(new Error(`${method}: DevTools connection closed`));
     const id = nextId++;
     ws.send(JSON.stringify(sessionId ? { id, method, params, sessionId } : { id, method, params }));
     return new Promise((res, rej) => waiting.set(id, (m) => (m.error ? rej(new Error(`${method}: ${m.error.message}`)) : res(m.result))));

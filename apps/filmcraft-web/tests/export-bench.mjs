@@ -5,7 +5,7 @@
 //     --url http://127.0.0.1:8765/ --project P2 --codec h264 \
 //     --encoder auto|hardware|software --compositor auto|gpu|cpu --sink auto|opfs|blob \
 //     --build st|mt --runs 5 --warmup 1 --label "<what changed>" --out target/web-bench \
-//     [--validate] [--ref target/web-bench/ref/P2.mov] [--expect-sha hex] [--trace] [--no-scrub] [--legacy] [--timeout-min 10]
+//     [--validate] [--ref target/web-bench/ref/P2.mov] [--expect-sha hex] [--trace] [--no-scrub] [--legacy] [--timeout-min 10] [--stall-s 60]
 //
 // Each run: a fresh tab, OPFS cleared, the project built through window.filmcraft, then
 // `file.exportMedia` while the harness scrubs the timeline ruler every 500 ms. Collected: wall
@@ -47,6 +47,9 @@ const opts = {
   legacy: flag("legacy"),
 };
 if (!opts.attach && !opts.launch) opts.attach = "http://127.0.0.1:9222";
+// an export whose frame count does not move for this long has stalled: fail the run then
+// (with the decoder / exporter state) instead of waiting for the project timeout
+const STALL_MS = Number(arg("stall-s", "60")) * 1000;
 const PROJECT_TIMEOUT_MS = Number(arg("timeout-min", opts.project === "P4" ? "90" : "10")) * 60000;
 const CODEC_FORMAT = { h264: "h264", hevc: "hevc" };
 // Pinned rate control so every encoder path is compared at equal bitrate.
@@ -204,6 +207,8 @@ async function oneRun(browser, project, runDir, i) {
       scrubbing = false;
     }, 500);
     let lastMetrics = 0;
+    let lastDone = -1;
+    let movedAt = Date.now();
     try {
       while (Date.now() - t0 < PROJECT_TIMEOUT_MS) {
         // (a CPU-rendered 4K step can hold the main thread for tens of seconds)
@@ -222,6 +227,13 @@ async function oneRun(browser, project, runDir, i) {
         samples.push(s);
         if (firstFrameMs == null && (job?.done ?? 0) > 0) firstFrameMs = s.t;
         if (!job || job.finished) break;
+        if ((job.done ?? 0) !== lastDone) {
+          lastDone = job.done ?? 0;
+          movedAt = Date.now();
+        } else if (Date.now() - movedAt > STALL_MS) {
+          r.stall = await page.js(`({ export: filmcraft.info().export, webcodecs: filmcraft.info().webcodecsStats })`, 30000).catch((e) => String(e));
+          throw new Error(`export stalled: frame ${lastDone} of ${job.total} for ${Math.round((Date.now() - movedAt) / 1000)} s`);
+        }
         await sleep(firstFrameMs == null ? 50 : 250);
       }
     } finally {
