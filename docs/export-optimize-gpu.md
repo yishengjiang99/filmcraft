@@ -248,7 +248,8 @@ win; increase `--runs` or investigate the noise source (thermal, other tabs, pow
 ### 4.2 Gates (must hold after every kept iteration)
 - `cargo xtask ci` passes. There are no new `unwrap`/`expect`/`unsafe`.
 - `smoke.mjs` passes (headless correctness).
-- Every exported file passes §2.2. The software path is byte-identical to baseline.
+- Every exported file passes §2.2. The software path is byte-identical to baseline (at the
+  baseline preset and thread count; see Phase 5 for the one sanctioned exception).
 - Zero console panics, uncaught rejections, or WebGPU validation errors. Zero leaked
   `VideoFrame`s or GPU buffers after export.
 - No regression beyond noise on any **non-target** metric: more than +5% wall time, more
@@ -283,40 +284,95 @@ WebGPU `OffscreenCanvas` and use `new VideoFrame(canvas, {timestamp, duration})`
 reach the hardware encoder without CPU readback. For the software path, use a 2–3 deep
 `mapAsync` readback ring. On decode, replace the 2D-canvas conversion with
 `importExternalTexture` / `copyExternalImageToTexture`. Add `timestamp-query` timing to
-`filmcraft.info().export.gpu`. *Target: P3 4K wall time ≥ 2.5× faster than Phase 1 with
-the CPU compositor; PSNR gates hold.*
+`filmcraft.info().export.gpu`. **Device-agnostic renderer:** the export renderer must take
+the `wgpu::Device`/`Queue` it is given and must not reach for eframe's device or any
+UI-owned resource. A `GPUDevice` cannot be transferred to a worker, so Phase 4b will create
+a second device in the export worker; nothing in this phase may make that a rewrite. Add a
+unit/integration test that builds the renderer on a freshly created device with no eframe
+context. **Measure, don't assume, zero-copy:** record per-frame time from canvas present to
+`VideoEncoder.encode()` return, and compare against the `mapAsync` readback path; Chrome
+does not document `new VideoFrame(webgpuCanvas)` as copy-free. *Target: P3 4K wall time
+≥ 2.5× faster than Phase 1 with the CPU compositor; PSNR gates hold.*
 
-**Phase 3: Streaming output.** Use `FragmentedWriter` (fMP4, ~1–2 s fragments) for web MP4,
-and progressive + faststart when the sink is seekable. Add a chunked streaming
-`OutputSink`, with sinks tried in this order:
-1. `showSaveFilePicker` → `FileSystemWritableFileStream`.
-2. OPFS `createSyncAccessHandle()` in a worker, downloaded as the OPFS `File` (no copy).
-3. `new Blob(chunks)`.
+**Order after Phase 2.** Phases 3–5 run in this order, each its own PR:
+**3a** (in-memory copies out, chunked fMP4) → **4a** (cooperative pump) → **4b** (export
+worker, which brings the OPFS sync sink) → **3b** (save picker) → **5** (only if its
+entry gate passes). 3a and 4a don't depend on Phase 2 and may start in parallel with it in
+a separate worktree.
 
-Check `navigator.storage.estimate()` and `persist()` first. Remove the `Entry::Mem` copy
-for exports. Image sequences go to `showDirectoryPicker` or a streamed ZIP (store, or
-`CompressionStream("deflate-raw")`). *Target: P4 (60 min 1080p) completes with wasm heap
-growth ≤ 512 MB; P2 peak memory ≤ 50% of baseline.*
+**Phase 3a: Chunked output, no whole-file buffer.** Replace `Out::Mem` for web exports
+with a chunked sink: the muxer's synchronous `Write` appends into a bounded queue of
+chunks (default 8 MiB each), and the pump hands finished chunks to JS between steps. When
+the queue is full, the pump stops producing frames until JS has drained it (backpressure);
+never block on a promise. Remove the `write_output` → `fs.rs::write_file` `Arc::from`
+copies for exports. Container choice, by sink:
+- **Unseekable sink** (Blob of chunks, stream): `FragmentedWriter`, ~1–2 s fragments.
+- **Seekable sink** (OPFS, save picker): progressive MP4. For faststart, **reserve** the
+  `moov` box at the start of the file. Export knows the exact frame and sample counts up
+  front, so the worst-case `moov` size is computable. Write the `moov` box into that space
+  at the end, padded with a `free` box. Never use `finish_faststart`'s whole-file rewrite
+  on web.
+Interleave audio and video into each fragment/chunk (≤ 1 s apart) so the muxer never holds
+one track's packets waiting for the other. The Blob fallback still holds the whole file in
+**browser** memory: say so in the UI for exports estimated over 2 GB, and offer the save
+picker where it exists. Check `navigator.storage.estimate()` against the estimated output
+size before starting, and call `persist()` for OPFS. Image-sequence ZIP /
+`showDirectoryPicker` is out of scope here; track it as a separate task.
+*Target: P2 peak tab memory (not just wasm heap) ≤ 50% of baseline; P4 completes with the
+Blob sink, wasm heap growth ≤ 512 MB.*
 
-**Phase 4: Off the main thread.** Run export in a dedicated worker with its own wasm
-instance. WebCodecs and WebGPU (`navigator.gpu`, `OffscreenCanvas`) are available in
-workers. Pass a project snapshot plus `File` handles; send progress, cancel and errors
-over `postMessage`. On cross-origin-isolated pages, also enable the `mt/` build's rayon
-slice threads for the software fallback, and try wasm memory64 behind detection. Until the
-worker lands: an adaptive pump with `scheduler.yield()` /
-`scheduler.postTask({priority: "background"})`, and bigger batches when hidden or idle.
-Make every export format stepped or worker-run, with no synchronous `run()` on wasm. Add an
-optional screen Wake Lock, a Web Lock per output file, and `Notification` /
-`setAppBadge` on completion. *Target: UI p95 ≤ 20 ms and zero long animation frames over
-50 ms caused by export during the concurrent-scrub test; export throughput ≥ the
-main-thread-pump throughput.*
+**Phase 4a: Cooperative pump (before the worker).** Replace the fixed 30 ms per egui frame
+pump with an adaptive one: step until `scheduler.yield()` is due (target ≤ 8 ms of export
+work per animation frame while the user is interacting, larger batches when the tab is
+idle or hidden), with a `setTimeout(0)` fallback where `scheduler` is missing. Make every
+export format stepped: GIF, image sequences and audio-only must stop calling a synchronous
+`run()` on wasm. This is a small change and is measured on its own, so the worker's gain
+is visible separately. *Target: no export-caused long animation frame over 100 ms; UI p95
+improvement recorded vs Phase 3a.*
 
-**Phase 5: Faster software fallback.** Add `core::arch::wasm32` simd128 kernels in
-`crates/h264enc` (SAD/SATD, sub-pel interpolation, 4x4/8x8 transforms + quant, deblock).
-They must be **bit-exact** with the scalar code, verified by tests that compare both
-implementations on random blocks. Use `Preset::Speed` for single-threaded wasm.
-*Target: P2 software-path wall time ≥ 1.8× faster than baseline, output byte-identical
-to scalar.*
+**Phase 4b: Export worker.** Run export in a dedicated worker with its own wasm instance,
+its own `wgpu` device (created from the Phase 2 device-agnostic renderer), and its own
+WebCodecs decoders. Pass a serialized project snapshot (the UI state is already serde) and
+`File` handles. Progress, cancel and errors go over `postMessage`. Inside the worker, add
+the OPFS `createSyncAccessHandle()` sink (it only works in dedicated workers), and
+download the result as the OPFS `File` with no copy. Things to budget and measure:
+- **Duplicate memory.** The worker re-opens media and rebuilds decode/index caches. Report
+  the worker's wasm heap separately from the UI's, and include both in peak tab memory.
+- **GPU contention.** The worker's compositor and encoder share the GPU with the UI.
+  Report UI frame GPU time during export; if p95 misses because of the GPU rather than the
+  main thread, record that rather than chasing it with CPU changes.
+- **Async stays async.** WebCodecs output callbacks run on the worker's own event loop, so
+  `Atomics.wait` on them deadlocks. Keep the Phase 1 bridging (JSPI where available, else
+  stepped).
+On cross-origin-isolated pages, the software fallback may use the `mt/` build's rayon
+threads from inside the worker. Dropped from this phase: wasm memory64 (not needed once
+output streams, and slower), Wake Lock, Web Locks, `Notification` and `setAppBadge`. List
+them under "later" in `docs/web-optimization-plan.md`. *Target: UI p95 ≤ 20 ms and zero
+export-caused long animation frames over 50 ms during the concurrent-scrub test; export
+throughput ≥ the Phase 4a pump.*
+
+**Phase 3b: Save picker sink.** Add `showSaveFilePicker` →
+`FileSystemWritableFileStream` (Chromium only) as the first-choice sink, using
+`write({type: "seek"})` for the reserved-`moov` layout from 3a. Writes are async: drive
+them from the same bounded chunk queue. A cancelled picker is a clean cancel. Sinks are
+tried in this order: save picker, OPFS (worker), Blob.
+
+**Phase 5: Faster software fallback (gated).** *Entry gate:* from `env.json` and the full
+matrix, list the browser/OS combinations where no WebCodecs H.264 encoder passes
+`isConfigSupported` (hardware **or** `prefer-software`). Also bench WebCodecs
+`prefer-software` against `h264enc` on P2. If WebCodecs software encode is available and
+faster on every combination tested, record that, and do only the smallest useful part of
+this phase (or none). Otherwise:
+- Profile `h264enc` on wasm first, and work on the top hotspots in profile order.
+- On the `mt/` build, add slice threads before SIMD if the profile supports it.
+- `simd128` kernels (SAD/SATD, sub-pel interpolation, transforms + quant, deblock) must be
+  **bit-exact** with the scalar code, verified by tests on random blocks.
+**Determinism rule (replaces "byte-identical to baseline" for this phase):** with the same
+preset and thread count, the SIMD build's output is byte-identical to the scalar build's.
+Changing the default wasm preset (for example to `Preset::Speed`) or the slice count is a
+separate, explicit decision. It changes the output, so it needs a new reference hash and
+PSNR/SSIM checks against the old one, and it must be logged as such.
+*Target: P2 software-path wall time ≥ 1.8× faster than baseline at the same preset.*
 
 **Applies to every phase:** feature-detect every API, check current support on MDN /
 caniuse / Chrome Platform Status before relying on it, and record a support matrix in
@@ -339,9 +395,9 @@ against the iteration-0 baseline:
 | 1 | P2 1080p30 H.264 export ≥ **4×** faster (hardware path) | export-bench wallMs median |
 | 2 | P3 4K export ≥ **6×** faster end to end (GPU + hardware) | export-bench |
 | 3 | UI p95 ≤ **20 ms**; no long animation frame over 50 ms from export during concurrent scrub | perf.stats + LoAF observer |
-| 4 | P4 60-min export completes; wasm heap growth ≤ **512 MB**; no leaks | memory samples, leak counters |
+| 4 | P4 60-min export completes with the OPFS/picker sinks; wasm heap growth (UI + worker) ≤ **512 MB**; peak tab memory reported for every sink, including Blob; no leaks | memory samples, `measureUserAgentSpecificMemory`, leak counters |
 | 5 | All outputs valid: ffprobe, `-xerror`, A/V sync ≤ 21 ms, PSNR ≥ 38 dB (min frame ≥ 30 dB), SSIM ≥ 0.97 | validate-export.mjs |
-| 6 | Software path byte-identical to baseline; SIMD bit-exact; software P2 ≥ 1.8× faster | sha256, unit tests, bench |
+| 6 | Software path byte-identical to baseline at the baseline preset and thread count; SIMD bit-exact with scalar; any preset/slice change logged with a new reference hash. If Phase 5 ran: software P2 ≥ 1.8× faster at the same preset. If its entry gate skipped it: the gate's evidence is recorded | sha256, unit tests, bench |
 | 7 | Fallbacks pass: `?softenc&cpu`, `?webgl`, `?nothreads`, and a correctness run in Firefox and Safari if available locally | smoke + validate |
 | 8 | `cargo xtask ci` green; docs updated (`docs/web.md` support matrix, `docs/web-optimization-plan.md`, `docs/performance.md`, `docs/benchmarks/web-export.md` with every iteration logged) | CI, review |
 
