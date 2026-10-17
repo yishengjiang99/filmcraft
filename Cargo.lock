@@ -2037,6 +2037,7 @@ dependencies = [
  "log",
  "pollster 0.4.0",
  "rayon",
+ "web-time",
  "wgpu",
 ]
 
@@ -2383,8 +2384,11 @@ dependencies = [
  "filmcraft-export",
  "filmcraft-format",
  "filmcraft-frame",
+ "filmcraft-gpu",
  "filmcraft-isobmff",
  "filmcraft-media",
+ "filmcraft-project",
+ "filmcraft-render",
  "filmcraft-time",
  "filmcraft-ui-egui",
  "js-sys",

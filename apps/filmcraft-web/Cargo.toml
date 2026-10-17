@@ -25,6 +25,9 @@ filmcraft-color = { workspace = true }
 filmcraft-isobmff = { workspace = true }
 filmcraft-format = { workspace = true }
 filmcraft-time = { workspace = true }
+filmcraft-gpu = { workspace = true }
+filmcraft-project = { workspace = true }
+filmcraft-render = { workspace = true }
 egui = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu"] }
 serde_json = { workspace = true }

@@ -164,6 +164,8 @@ async function oneRun(browser, project, runDir, i) {
     if (!params.format) throw new Error(`codec ${opts.codec} is not exportable yet`);
     if (!opts.legacy && opts.encoder !== "auto") params.encoder = opts.encoder;
     if (!opts.legacy && opts.sink !== "auto") params.sink = opts.sink;
+    // gpu: composite the export on WebGPU; cpu: the CPU reference renderer (also `?cpu` above)
+    if (!opts.legacy && opts.compositor !== "auto") params.gpuRendering = opts.compositor === "gpu" ? "auto" : "off";
     r.params = params;
 
     let downloadDone = null;
@@ -271,6 +273,10 @@ async function oneRun(browser, project, runDir, i) {
       export: {
         backend: infoAfter.export?.backend ?? (perf?.export?.hardware?.sessions ? "hardware" : "h264enc"),
         compositor: infoAfter.export?.compositor ?? "cpu",
+        gpuFrames: infoAfter.export?.gpuFrames ?? null,
+        cpuFrames: infoAfter.export?.cpuFrames ?? null,
+        gpuEffects: infoAfter.export?.gpuEffects ?? null,
+        gpuError: infoAfter.export?.gpuError ?? null,
         sink: infoAfter.export?.sink ?? "blob",
         thread: infoAfter.export?.thread ?? "main",
         gpu: infoAfter.export?.gpu ?? null,

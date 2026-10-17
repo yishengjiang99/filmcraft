@@ -309,6 +309,62 @@ mod tests {
         assert_parity(&cpu, &gpu, "transformed");
     }
 
+    /// The asynchronous read-back (the web's path) gives exactly the synchronous renderer's
+    /// pixels, frame for frame, with several frames in flight, prefetched out of order, and with
+    /// fewer staging buffers than frames asked for (finished frames are reclaimed, never mixed up).
+    #[test]
+    fn async_readback_matches_sync() {
+        let Some((_, device, queue)) = shared_device() else {
+            eprintln!("SKIPPED (gpu async export): no adapter");
+            return;
+        };
+        let Some(mut sync) = ExportRenderer::new() else { return };
+        let (p, seq, m) = project(true);
+        let r = filmcraft_time::FrameRate::FPS_24;
+        let row = (320u64 * 8).div_ceil(256) * 256;
+        // three staging buffers
+        let mut a = crate::AsyncExportRenderer::new(&device, &queue, row * 180 * 3);
+        assert_eq!(a.frames_in_flight(320, 180), 3);
+        let no = || false;
+        for f in 0..12 {
+            let t = r.tick_of(f);
+            for ahead in 1..=4 {
+                a.prefetch(&p, seq, r.tick_of(f + ahead), RenderOptions::default(), &m, &no);
+            }
+            let want = sync.render(&p, seq, t, RenderOptions::default(), &m).expect("sync GPU frame");
+            let mut got = None;
+            for _ in 0..2_000 {
+                match a.render(&p, seq, t, RenderOptions::default(), &m, &no) {
+                    crate::AsyncFrame::Ready(img) => {
+                        got = Some(img);
+                        break;
+                    }
+                    crate::AsyncFrame::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    crate::AsyncFrame::Declined => panic!("declined: {:?}", a.failed()),
+                }
+            }
+            let got = got.expect("the read-back finished");
+            assert_eq!((got.w, got.h), (want.w, want.h));
+            assert!(got.px == want.px, "frame {f}: async read-back differs from the sync one");
+        }
+        assert!(a.failed().is_none());
+        // a plan whose media is still loading is not submitted
+        let t = r.tick_of(20);
+        assert!(matches!(a.render(&p, seq, t, RenderOptions::default(), &m, &|| true), crate::AsyncFrame::Pending));
+        let mut done = false;
+        for _ in 0..2_000 {
+            match a.render(&p, seq, t, RenderOptions::default(), &m, &no) {
+                crate::AsyncFrame::Ready(_) => {
+                    done = true;
+                    break;
+                }
+                crate::AsyncFrame::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
+                crate::AsyncFrame::Declined => panic!("declined"),
+            }
+        }
+        assert!(done);
+    }
+
     #[test]
     fn gpu_render_impls_frame_renderer() {
         // dev-dependency: the same wrapper the app and CLI register.

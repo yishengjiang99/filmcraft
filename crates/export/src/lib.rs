@@ -386,7 +386,9 @@ pub struct ExportSettings {
     pub stream_sink: Option<String>,
     /// Composite the exported frames on the GPU instead of the CPU reference renderer (Export ▸
     /// GPU rendering: Auto / Off, Off by default). Off = the CPU reference renderer exactly.
-    #[serde(default)]
+    /// On the web (wasm) the default is `Auto`: the app registers its WebGPU compositor only when
+    /// the page runs on WebGPU, and the CPU path there is many times slower.
+    #[serde(default = "default_gpu_rendering")]
     pub gpu_rendering: GpuRendering,
     /// VBR maximum bitrate (None = 1.5 × target).
     pub max_bitrate_kbps: Option<u32>,
@@ -699,7 +701,7 @@ impl Default for ExportSettings {
             hardware_encoding: default_hardware_encoding(),
             require_hardware: false,
             stream_sink: None,
-            gpu_rendering: GpuRendering::Off,
+            gpu_rendering: default_gpu_rendering(),
             max_bitrate_kbps: None,
             adaptive_bitrate: None,
             keyframe_distance: None,
@@ -723,6 +725,11 @@ pub const DEFAULT_CRF: f32 = 23.0;
 /// `Auto` on the web (WebCodecs), `Off` natively (see [`ExportSettings::hardware_encoding`]).
 fn default_hardware_encoding() -> HardwareEncoding {
     if cfg!(target_arch = "wasm32") { HardwareEncoding::Auto } else { HardwareEncoding::Off }
+}
+
+/// `Auto` on the web (WebGPU), `Off` natively (see [`ExportSettings::gpu_rendering`]).
+fn default_gpu_rendering() -> GpuRendering {
+    if cfg!(target_arch = "wasm32") { GpuRendering::Auto } else { GpuRendering::Off }
 }
 
 fn default_crf() -> f32 {

@@ -110,13 +110,37 @@ until the first click or key press; until then playback runs on the wall clock.
 ### GPU
 
 eframe creates a WebGPU device when the browser has one, else WebGL2. FilmCraft's GPU compositor
-(`filmcraft-gpu`) is used on WebGPU; on WebGL2 frames are composited on the CPU. Check
-`filmcraft.info().backend` and `.compositor`.
+(`filmcraft-gpu`) is used on WebGPU, for the monitors and for exports; on WebGL2 (and with `?cpu`)
+frames are composited on the CPU. Check `filmcraft.info().backend` and `.compositor`.
+
+WebGPU answers error scopes asynchronously (a promise), so the compositor cannot know at creation
+whether its effect stage (Lumetri, blurs… as compute shaders) compiled: it uses the stage and drops
+it if the answer, checked every frame, is an error. (It used to assume the worst, which sent every
+layer effect of the web build to the CPU, in previews too.)
 
 ### Export
 
-Exports run as stepped jobs on the UI thread (`Session::pump_jobs`, ~30 ms per frame). The picture
-is composited on the CPU; H.264 and HEVC are encoded by the browser's WebCodecs `VideoEncoder`
+Exports run as stepped jobs on the UI thread (`Session::pump_jobs`, ~30 ms per call).
+
+**Compositing.** On WebGPU the picture is composited on the GPU, on eframe's own device
+(`gpu_export.rs`, `filmcraft_gpu::AsyncExportRenderer`): the main thread may not block on a
+read-back, so a frame is submitted (composite into the linear float accumulator, copy into one of a
+ring of staging buffers, `mapAsync`) and answered `Pending`; the exporter yields and a later step
+collects it (half floats → f32, as the desktop's synchronous read-back does), then the CPU
+post-processing (placement, overlays, limiter, RGBA8) runs as before. The exporter steps in batches
+of half the frames the ring holds (512 MiB of staging buffers: 1080p 8 frames a step, 4K 3) and
+prefetches the next batch before collecting the current one, so the GPU draws batch *k+1* while the
+CPU converts and encodes batch *k*. Frames the GPU path declines render on the CPU: transitions
+other than dissolves (`FramePlan::Composite`), adjustment layers, HDR / wide-gamut sequences, and
+every frame after a GPU validation / out-of-memory error, a failed `mapAsync` (lost device) or a
+read-back slower than 10 s. `file.exportMedia` `gpuRendering: "off"` keeps an export on the CPU
+(the default on the web is `auto`; natively `off`); `?cpu` / `?webgl` have no WebGPU export at all.
+`filmcraft.info().export.compositor` says what drew the last export (`gpu`, `cpu`, or `gpu+cpu`
+when some frames fell back), with `gpuFrames` / `cpuFrames`, `gpuEffects` (effect stage on the
+GPU) and `gpuError` (why the GPU path stopped). `export.gpu` (timestamp-query pass timings) is
+`null`: eframe's device is created without the `timestamp-query` feature.
+
+**Encoding.** H.264 and HEVC are encoded by the browser's WebCodecs `VideoEncoder`
 (hardware where the browser has one: `webcodecs_encode.rs`) and otherwise by the built-in H.264
 encoder. The choice is `file.exportMedia` `encoder`: `auto` (default on the web: WebCodecs when the
 start-up `isConfigSupported` probe passed with `prefer-hardware`), `hardware` (fail instead of
@@ -127,7 +151,7 @@ BT.709 limited-range conversion as the software and VideoToolbox paths and hande
 WebCodecs is asynchronous: the exporter yields (`Step::Pending`) while the encoder's queue is full
 (> 8) or its codec record has not arrived, and after `flush` until the last chunk came back.
 `filmcraft.info().export` reports the backend (`webcodecs-hw` / `h264enc`), queue high-water mark,
-encoder errors, compositor, sink and thread.
+encoder errors, compositor (see above), sink and thread.
 
 ## `window.filmcraft`: the agent / test API
 

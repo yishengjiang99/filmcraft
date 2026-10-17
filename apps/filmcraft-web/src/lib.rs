@@ -11,6 +11,7 @@
 //! | auto-save + recovery journal (data dir) | OPFS snapshot + media copies ([`recovery`], [`opfs`]) |
 //! | cpal audio output | WebAudio `AudioWorklet`, played-frame clock ([`audio`]) |
 //! | VideoToolbox… | WebCodecs `VideoDecoder` ([`webcodecs`]) |
+//! | off-screen GPU export device, blocking read-back | eframe's WebGPU device, asynchronous read-back ([`gpu_export`]) |
 //! | frame worker threads | cooperative frame queue pumped between UI frames (`FrameServer::pump`) |
 //! | TCP control channel / MCP | `window.filmcraft` JavaScript API ([`api`]) |
 //!
@@ -23,6 +24,7 @@ pub mod audio;
 pub mod download_pacing;
 pub mod export_sink;
 pub mod fs;
+pub mod gpu_export;
 pub mod import;
 pub mod opfs;
 pub mod recovery;
@@ -210,6 +212,8 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
                     && backend == Some(eframe::wgpu::Backend::BrowserWebGpu)
                     && !query_flag("cpu")
                 {
+                    // exports composite on the same device (`?cpu` keeps them on the CPU too)
+                    gpu_export::install(&rs.device, &rs.queue);
                     app.set_wgpu(rs);
                     set_info("compositor", json!("gpu"));
                 } else {

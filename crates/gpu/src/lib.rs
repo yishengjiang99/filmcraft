@@ -39,11 +39,13 @@ use filmcraft_render::Blend;
 use filmcraft_render::plan::{FramePlan, PlanLayer, PlanStep};
 
 pub mod adapter;
+pub mod async_export;
 pub mod export_renderer;
 pub mod fx;
 pub mod lut;
 pub mod mask;
 mod transition;
+pub use async_export::{AsyncExportRenderer, AsyncFrame};
 pub use export_renderer::ExportRenderer;
 pub use lut::GpuLut;
 pub use mask::GpuMask;
@@ -83,11 +85,16 @@ pub struct GpuCompositor {
     output: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
     accum_readback_buf: Option<(wgpu::Buffer, u64)>,
     uploads: HashMap<(usize, u32, u32), Uploaded>,
+    /// Uploads kept for reuse ([`set_upload_cache`](Self::set_upload_cache)).
+    upload_cache: usize,
     clock: u64,
     dummy: wgpu::TextureView,
     /// The effect stage (None on devices without compute shaders or storage textures: layers
     /// with effects are then rendered on the CPU here).
     fx: Option<fx::FxStage>,
+    /// The effect stage's creation error scope, still unanswered (WebGPU answers asynchronously).
+    #[cfg(target_arch = "wasm32")]
+    fx_check: Option<FxCheck>,
     transition: transition::PushStage,
     transition_inputs: [Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>; 2],
     pub gpu_transitions: u64,
@@ -391,16 +398,28 @@ impl GpuCompositor {
         // The effect stage's pipelines can still be invalid on a device that passes the limits
         // check (Rgba32Float is not renderable everywhere, e.g. software Vulkan/GL). Validation
         // errors would panic, so they are captured: without the stage, effects render on the CPU.
+        #[cfg(target_arch = "wasm32")]
+        let mut fx_check = None;
         let fx = fx::FxStage::supported(device)
             .then(|| {
                 let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
                 let stage = fx::FxStage::new(device, &shader, &layer_bgl);
-                match poll_now(scope.pop()) {
+                let mut popped = Box::pin(scope.pop());
+                match poll_now(popped.as_mut()) {
                     Some(None) => Some(stage),
                     Some(Some(e)) => {
                         log::warn!("GPU effects unavailable on this device, rendering them on the CPU: {e}");
                         None
                     }
+                    // WebGPU answers error scopes asynchronously (a promise): use the stage and
+                    // drop it if the answer, checked at every frame, is an error (`check_fx`).
+                    // Assuming the worst here sent every effect of the web build to the CPU.
+                    #[cfg(target_arch = "wasm32")]
+                    None => {
+                        fx_check = Some(popped as FxCheck);
+                        Some(stage)
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
                     None => None,
                 }
             })
@@ -419,9 +438,12 @@ impl GpuCompositor {
             output: None,
             accum_readback_buf: None,
             uploads: HashMap::new(),
+            upload_cache: 24,
             clock: 0,
             dummy,
             fx,
+            #[cfg(target_arch = "wasm32")]
+            fx_check,
             transition: transition::PushStage::new(device),
             transition_inputs: [None, None],
             gpu_transitions: 0,
@@ -577,10 +599,11 @@ impl GpuCompositor {
         };
         self.uploads.insert(key, up);
         // keep the most recent uploads (enough for several stacked layers + playback lookahead)
-        if self.uploads.len() > 24 {
+        let cap = self.upload_cache;
+        if self.uploads.len() > cap {
             let mut v: Vec<(u64, (usize, u32, u32))> = self.uploads.iter().map(|(k, u)| (u.last_used, *k)).collect();
             v.sort_unstable();
-            for (_, k) in v.into_iter().take(self.uploads.len() - 24) {
+            for (_, k) in v.into_iter().take(self.uploads.len() - cap) {
                 self.uploads.remove(&k);
             }
         }
@@ -699,6 +722,36 @@ impl GpuCompositor {
         buf
     }
 
+    /// Drop the effect stage once WebGPU answered its creation scope with an error (effects then
+    /// render on the CPU). Native scopes are answered at creation; this does nothing there.
+    fn check_fx(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(check) = self.fx_check.as_mut() {
+            match poll_now(check.as_mut()) {
+                Some(Some(e)) => {
+                    log::warn!("GPU effects unavailable on this device, rendering them on the CPU: {e}");
+                    self.fx = None;
+                    self.fx_check = None;
+                }
+                Some(None) => self.fx_check = None,
+                None => {}
+            }
+        }
+    }
+
+    /// Keep at most `n` uploaded frames for reuse (24 by default: stacked layers plus playback
+    /// lookahead). Each keeps its source pixels alive too, so an export, whose frames rarely
+    /// repeat, keeps fewer: on the web's 2 GiB heap 24 decoded 4K frames are too many. At least as
+    /// many as one frame has layers stay (`n` ≥ 8).
+    pub fn set_upload_cache(&mut self, n: usize) {
+        self.upload_cache = n.max(8);
+    }
+
+    /// Whether layer effects run on the GPU (the effect stage exists on this device).
+    pub fn has_effect_stage(&self) -> bool {
+        self.fx.is_some()
+    }
+
     /// Composite a plan; returns the output view (sRGB, over black) and its size.
     pub fn composite(&mut self, plan: &FramePlan) -> (wgpu::TextureView, (u32, u32)) {
         self.composite_prepared(plan, None)
@@ -711,6 +764,7 @@ impl GpuCompositor {
     }
 
     fn render_plan(&mut self, plan: &FramePlan, prep: Option<&PreparedPlan>, clear: bool, resolve: bool) -> (wgpu::TextureView, (u32, u32)) {
+        self.check_fx();
         let owned;
         let (w, h, layers): (u32, u32, &[PlanLayer]) = match plan {
             FramePlan::Layers { width, height, layers } => (*width as u32, *height as u32, layers.as_slice()),
@@ -971,7 +1025,7 @@ impl GpuCompositor {
         if matches!(plan, FramePlan::Composite { .. }) {
             return None;
         }
-        let t = std::time::Instant::now();
+        let t = web_time::Instant::now();
         self.render_plan(plan, prep, true, false);
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("filmcraft-composite-export") });
         let size = self.copy_accumulator(&mut enc)?;
@@ -1055,9 +1109,7 @@ impl GpuCompositor {
     /// Record a copy of the accumulator into the staging buffer (grown when too small, reused
     /// otherwise); returns its width, height and row pitch in bytes.
     fn copy_accumulator(&mut self, enc: &mut wgpu::CommandEncoder) -> Option<(u32, u32, u32)> {
-        let (_, _, (w, h)) = self.accum.as_ref()?;
-        let (w, h) = (*w, *h);
-        let row = w.checked_mul(8)?.div_ceil(256).checked_mul(256)?;
+        let (_, h, row) = self.accumulator_layout()?;
         let needed = u64::from(row) * u64::from(h);
         if self.accum_readback_buf.as_ref().is_none_or(|(_, size)| *size < needed) {
             let b = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1068,8 +1120,30 @@ impl GpuCompositor {
             });
             self.accum_readback_buf = Some((b, needed));
         }
-        let (tex, _, _) = self.accum.as_ref()?;
         let (buf, _) = self.accum_readback_buf.as_ref()?;
+        self.copy_accumulator_into(enc, buf)
+    }
+
+    /// Submit recorded commands on the compositor's queue.
+    fn submit(&self, enc: wgpu::CommandEncoder) {
+        self.queue.submit([enc.finish()]);
+    }
+
+    /// Width, height and read-back row pitch (bytes, 256-aligned) of the accumulator.
+    fn accumulator_layout(&self) -> Option<(u32, u32, u32)> {
+        let (_, _, (w, h)) = self.accum.as_ref()?;
+        let row = w.checked_mul(8)?.div_ceil(256).checked_mul(256)?;
+        Some((*w, *h, row))
+    }
+
+    /// Record a copy of the accumulator into `buf` (at least `row * h` bytes, see
+    /// [`accumulator_layout`](Self::accumulator_layout)).
+    fn copy_accumulator_into(&self, enc: &mut wgpu::CommandEncoder, buf: &wgpu::Buffer) -> Option<(u32, u32, u32)> {
+        let (w, h, row) = self.accumulator_layout()?;
+        if buf.size() < u64::from(row) * u64::from(h) {
+            return None;
+        }
+        let (tex, _, _) = self.accum.as_ref()?;
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyBufferInfo { buffer: buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
@@ -1084,7 +1158,7 @@ impl GpuCompositor {
         if w == 0 || h == 0 {
             return None;
         }
-        let t = std::time::Instant::now();
+        let t = web_time::Instant::now();
         let (buf, _) = self.accum_readback_buf.as_ref()?;
         let slice = buf.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1094,22 +1168,13 @@ impl GpuCompositor {
         wait_mapped(&self.device)?;
         rx.recv().ok()?.ok()?;
         export_renderer::timing::add_map_wait(t.elapsed());
-        let t = std::time::Instant::now();
-        let (width, row) = (w as usize, row as usize);
-        let mut out = filmcraft_frame::pool::take_f32_overwritten(width.checked_mul(h as usize)?.checked_mul(4)?);
+        let t = web_time::Instant::now();
         let data = slice.get_mapped_range().ok()?;
-        // every row must be there: the pooled output holds stale values until written
-        let converted = out.chunks_exact_mut(width * 4).enumerate().all(|(y, dst)| {
-            let Some(src) = data.get(y * row..y * row + width * 8) else { return false };
-            for (d, s) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
-                *d = f16_to_f32_fast(u16::from_le_bytes(*s));
-            }
-            true
-        });
+        let out = half_rows_to_f32(&data, w, h, row);
         drop(data);
         buf.unmap();
         export_renderer::timing::add_convert(t.elapsed());
-        converted.then_some((w, h, out))
+        out.map(|px| (w, h, px))
     }
 
     /// Read the output back as RGBA8 (tests / screenshots / thumbnails).
@@ -1147,6 +1212,37 @@ impl GpuCompositor {
     }
 }
 
+/// Rows of half-float RGBA (`row` bytes apart) as f32 RGBA, in a pooled buffer. None when `data`
+/// is short (the pooled output would keep stale values where rows are missing).
+pub(crate) fn half_rows_to_f32(data: &[u8], w: u32, h: u32, row: u32) -> Option<Vec<f32>> {
+    let (width, row) = (w as usize, row as usize);
+    if width == 0 || h == 0 {
+        return None;
+    }
+    let mut out = filmcraft_frame::pool::take_f32_overwritten(width.checked_mul(h as usize)?.checked_mul(4)?);
+    if convert_half_rows(data, &mut out, width, row) {
+        Some(out)
+    } else {
+        filmcraft_frame::pool::recycle_f32(out);
+        None
+    }
+}
+
+/// Convert rows of `width` half-float RGBA pixels, `row` bytes apart in `data`, into `dst` (whole
+/// rows of f32 RGBA). False when `data` is short: `dst` then holds stale values.
+pub(crate) fn convert_half_rows(data: &[u8], dst: &mut [f32], width: usize, row: usize) -> bool {
+    if width == 0 {
+        return false;
+    }
+    dst.chunks_exact_mut(width * 4).enumerate().all(|(y, dst)| {
+        let Some(src) = data.get(y * row..y * row + width * 8) else { return false };
+        for (d, s) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
+            *d = f16_to_f32_fast(u16::from_le_bytes(*s));
+        }
+        true
+    })
+}
+
 /// Wait for the last submission and its `map_async` callbacks.
 ///
 /// Export readback used `PollType::wait_indefinitely`. On radv that can never return after a
@@ -1174,6 +1270,10 @@ struct SrcInfo {
 
 /// Floats in a layer's uniform block (`U` in `composite.wgsl`: 13 vec4).
 const UNIFORM_FLOATS: usize = 52;
+
+/// A pending error-scope answer (wasm only: WebGPU objects live on one thread).
+#[cfg(target_arch = "wasm32")]
+type FxCheck = std::pin::Pin<Box<dyn std::future::Future<Output = Option<wgpu::Error>>>>;
 
 /// Poll a future once: wgpu's native error scopes resolve immediately. `None` if it is still
 /// pending (then the caller assumes the worst).

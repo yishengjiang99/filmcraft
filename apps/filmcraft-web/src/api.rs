@@ -163,7 +163,9 @@ pub fn install() -> Result<(), JsValue> {
             v["memory"] = json!({ "wasmBytes": wasm_bytes });
             // export path: encoder backend and counters, compositor, output sink, thread
             let mut export = crate::webcodecs_encode::stats();
-            export["compositor"] = json!("cpu");
+            if let (Some(e), serde_json::Value::Object(g)) = (export.as_object_mut(), crate::gpu_export::stats()) {
+                e.extend(g);
+            }
             export["sink"] = json!(crate::export_sink::last_kind().unwrap_or_else(|| "memory".into()));
             export["thread"] = json!("main");
             v["export"] = export;

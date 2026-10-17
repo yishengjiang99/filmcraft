@@ -504,7 +504,10 @@ pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut set
     if cfg!(target_arch = "wasm32") && !wait && filmcraft_export::stepped(format) {
         // No threads: the host advances the export between UI frames (`Session::pump_jobs`).
         let mut exporter = filmcraft_export::Exporter::new(project, seq, &settings, &prog).map_err(|e| EngineError::Other(e.to_string()))?;
-        exporter.set_batch(1);
+        // one frame per step keeps UI frames short; a GPU renderer that reads back asynchronously
+        // gets batches that keep several frames in flight
+        let batch = exporter.async_batch().unwrap_or(1);
+        exporter.set_batch(batch);
         s.jobs.push(job);
         s.stepped.push(crate::SteppedJob { job: id, exporter, provider, progress: prog, result: res });
         return Ok(id);
