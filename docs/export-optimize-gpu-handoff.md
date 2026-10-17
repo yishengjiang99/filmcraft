@@ -1,7 +1,7 @@
 # Handoff: GPU-first, hardware-encoded, streaming web export
 
 Status of the work on [`export-optimize-gpu.md`](export-optimize-gpu.md) (the plan) as of
-2026-10-17. Numbers: [`benchmarks/web-export.md`](benchmarks/web-export.md); every number there
+2026-10-17 (evening). Numbers: [`benchmarks/web-export.md`](benchmarks/web-export.md); every number there
 cites a `target/web-bench/results.jsonl` line (label + git sha) on the bench machine.
 
 ## Where it stands
@@ -13,7 +13,7 @@ cites a `target/web-bench/results.jsonl` line (label + git sha) on the bench mac
 | §2.4 baseline | short projects (P1s/P2s/P3s) + full P1 measured; full P2/P3/P4 not run (see "Baseline") |
 | Phase 1 WebCodecs hardware encoder | done, committed (`bd13e6c8`); measured on P1s/P2s (below) |
 | Phase 3 streaming output (OPFS / Blob) | streaming done (`bd13e6c8`; OPFS + Blob sinks validated); in the revised plan this is part of **3a**, whose missing piece is backpressure (`export-sink.js` queues writes on an unbounded promise chain) and fMP4 for unseekable sinks |
-| Phase 2 GPU compositing for export | **working on `main`** (`2ffd57eb`..`36fdfadf`): P1s/P2s/P3s render every frame on the GPU and validate; timed matrix not run yet; remaining items under "Phase 2 state" |
+| Phase 2 GPU compositing for export | **working and timed on `main`** (`2ffd57eb`..`61362d26`, label `phase2b`): P1s 4.1×, P2s 13.1×, P3s 45.6× vs baseline, all frames on the GPU, all outputs valid; P3s on the CPU compositor not timed (browser exited); remaining items under "Phase 2 state" |
 | Phase 4 off the main thread | not started; the revised plan splits it into **4a** (cooperative `scheduler.yield` pump) and **4b** (export worker) |
 | Phase 5 simd128 in `h264enc` | done, on `main` (`5a5e4e79`..`64348228`): software encoder 1.9x faster on wasm (node), 1.75x native, bytes unchanged; Chrome export + P1s sha check not yet run |
 
@@ -133,6 +133,9 @@ matroska changes or `Cargo.lock` changes (which forces the full suite).
   CRA drops the leading pictures. The WebCodecs source must start one GOP earlier (it does now,
   as `filmcraft_codecs`' `decode_start`); P3s's 4K fixture has such GOPs (sample 116 is a CRA
   with pts of frame 120; frames 116–119 follow it).
+- **Disk again**: the first `phase2b` matrix failed with "Failed to fetch" at 4.7 GiB free
+  (Chrome spools media; one matrix used ~1.6 GiB). Check `df` before a matrix and print it
+  before each config.
 - **Do not attach a second CDP client to the benchmark tab**: a probe script's connection may
   have closed the harness's socket once (it exited with "unsettled top-level await"; sends now
   fail on a closed connection instead).
@@ -148,18 +151,24 @@ All on `main`, pushed. Commits: `b40586f3` asynchronous frame renderers in the s
 monitors 128 MiB, released when the job is dropped), `mt` heap max 4 GiB, harness trap handling;
 `6fe735d5` Lumetri Look LUT on the GPU effect stage (own pass, storage-buffer 3D table, parity
 3e-7); `34cab1fc` WebCodecs open-GOP start + recently asked frames pinned
-(`filmcraft_media::cache::evict_far`); `36fdfadf` harness stall detection. Also `9fca3178` (wasm
+(`filmcraft_media::cache::evict_far`); `36fdfadf` harness stall detection; `61362d26` WebCodecs
+pins the decoder's run-ahead of the newest asks (`run_ahead_pins`: the CPU compositor had
+regressed to 22.5 s on P1s, 3061 frames decoded for 180). Also `9fca3178` (wasm
 clippy in `proxies.rs`, unrelated).
 
-Single correctness runs (not benchmarks), Chrome 155.0.8059.40, `mt`, hardware encoder, OPFS,
-`--compositor gpu`:
+Timed (`phase2b`, 3 runs + warmup, Chrome 155.0.8059.40, `mt`, hardware encoder, OPFS; full
+table in [`benchmarks/web-export.md`](benchmarks/web-export.md)):
 
-| project | wall s | baseline s | GPU / CPU frames | wasm peak MB (baseline) | UI p95 ms (baseline) | Y-PSNR dB (min) | SSIM |
+| project | GPU compositor s | CPU compositor s | baseline s | vs baseline | wasm peak MiB GPU (baseline) | UI p95 ms GPU / CPU | Y-PSNR dB GPU (min) |
 |---|---|---|---|---|---|---|---|
-| P2s | 10.7 | 168.2 | 360 / 0 | — (1400) | — | 46.38 (43.18) | 0.985 |
-| P3s | 27.6 | 1118.0 | 180 / 0 | 893 (1933) | 300 (5292) | 51.32 (48.65) | 0.997 |
+| P1s | 5.76 ± 0.02 | 7.14 ± 0.03 | 23.6 | 4.1× | 237 (619) | 116 / 42 | 48.05 (43.78) |
+| P2s | 12.83 ± 0.01 | 134.49 ± 0.38 | 168.2 | 13.1× | 472 (1400) | 102 / 658 | 46.38 (43.18) |
+| P3s | 24.51 ± 0.46 | — (browser exited at frame 165) | 1118.0 | 45.6× | 813 (1933) | 357 / — | 51.32 (48.65) |
 
-P3s stage times: render 10.4 s, encode 6.6 s, RGB→YUV 6.3 s; GPU read-back latency ~0.2 s.
+Plan targets: P2 ≥ 4× and P3 ≥ 6× met (on the short cuts); UI p95 ≤ 20 ms not met.
+
+P3s stage times (GPU, median): render 10.2 s, encode 6.6 s, RGB→YUV 6.3 s; GPU read-back latency
+~0.2 s.
 
 How P3s got there (each step a run): with the 2 GiB `mt` heap it trapped; lean caches + 4 GiB
 kept it at 1.6–1.7 GB but at ~19 s/frame, because the Look LUT made the planner render the whole
@@ -169,9 +178,10 @@ the export livelocked at frame 116 (WebCodecs restarting at a CRA, ~185 decodes/
 delivered); the open-GOP start fixed that.
 
 Still to do for Phase 2:
-- The timed matrix (`--compositor gpu` vs `cpu`, P1s/P2s/P3s, 3 runs + warmup) on a quiet machine,
-  logged in `docs/benchmarks/web-export.md` (the plan's P3 target compares with Phase 1 on the
-  CPU compositor, never measured because it trapped: measure it now that it fits).
+- Time P3s on the CPU compositor (one run, ~16 min; the bench Chrome exited during it on
+  2026-10-17 at 22:01 and has not been relaunched: the user restarts it).
+- UI p95 on the GPU path (102–357 ms vs 42 ms on the CPU compositor): steps render a batch of
+  several frames; size batches by measured step time.
 - Device rule from the revised plan: `AsyncExportRenderer` already takes any device; make
   `gpu_export::install` take a plain `wgpu::Device`/`Queue` instead of eframe's types.
 - GPU coverage: Lumetri input LUT, curves, wheels, HSL secondary and Sharpen still send a layer to
@@ -195,23 +205,40 @@ Still to do for Phase 2:
 
 ## Next steps (in order)
 
-The plan was revised on 2026-10-17 (PR #1, `7b9939be` + `b200e580`): after Phase 2 the order is
-**3a → 4a → 4b → 3b → 5**; 3a and 4a do not depend on Phase 2.
+The plan was revised on 2026-10-17 (PR #1, `7b9939be` + `b200e580`; loop ladder `66af744f`): after
+Phase 2 the order is **3a → 4a → 4b → 3b → 5**; 3a and 4a do not depend on Phase 2.
 
-1. Phase 2: the timed matrix and the items under "Phase 2 state".
-2. `bench-compare.mjs` pairs results by exact config name, so baseline (`software-cpu-auto`) and
-   new (`hardware-gpu-opfs`) configs do not line up: add a `--map` / project-level comparison.
-3. 3a: bounded chunk queue with backpressure in front of the existing `StreamTarget`; fMP4 for
-   unseekable sinks, reserved-`moov` progressive MP4 for seekable ones; peak tab memory
-   (`measureUserAgentSpecificMemory`, already recorded as `uaBefore`/`uaAfter`) in the criteria.
-4. 4a: adaptive `scheduler.yield` pump; GIF, image sequences and audio-only stepped.
-5. 4b: export worker with its own wasm instance, `wgpu` device and WebCodecs decoders (keep the
-   open-GOP start and frame pinning); the OPFS sync-handle sink.
-6. 3b: save picker sink.
-7. 5: only if a WebCodecs `prefer-software` vs `h264enc` bench justifies it. Earlier follow-ups:
-   measure the software path in Chrome (`--encoder software`, P1s must keep sha `97aad066…`);
-   wasm hot spots are 16x16 SATD in the sub-pel search, CABAC `renorm`, `mc_luma` and the
-   half-sample interpolation. `Preset::Speed` stays opt-in (it changes the output).
+1. **Restart the bench Chrome** (user) and time P3s on the CPU compositor.
+2. **Phase 2 leftovers**, cheapest first: batch size by step time (UI p95); `gpu_export::install`
+   on a plain `wgpu::Device` (device rule); GPU RGB→YUV pass (6.3 s of P3s's 24.5 s); remaining
+   GPU coverage (Lumetri input LUT / curves / wheels / HSL / Sharpen, adjustment layers, complex
+   transitions, HDR); `importExternalTexture` for decoded frames; zero-copy `new
+   VideoFrame(webgpuCanvas)` (measure first); `timestamp-query` timings.
+3. **Harness pieces the revised §4 loop names** (not built): `xtask web --no-opt`; a 60-frame P2
+   smoke project; first-error abort on console / WebGPU errors; `--stall-s` default 15 and a
+   timeout of 3× the baseline wall time; sampled-frame PSNR; A/B interleaving on two ports with
+   early stop; `bench-compare --map` for differently named configs.
+4. **3a**: bounded chunk queue with backpressure in front of the existing `StreamTarget`; fMP4 for
+   unseekable sinks, reserved-`moov` progressive MP4 for seekable ones; A/V interleaving per
+   chunk; remove `sink: "memory"` and the `write_output` copies; `storage.estimate()` /
+   `persist()`; peak tab memory in the criteria.
+5. **4a**: adaptive `scheduler.yield` pump; GIF, image sequences and audio-only stepped.
+6. **4b**: export worker with its own wasm instance, `wgpu` device and WebCodecs decoders (keep
+   the open-GOP start and run-ahead pinning); the OPFS sync-handle sink; parallel CPU rendering on
+   the `mt` build.
+7. **3b**: save picker sink.
+8. **5**, only if a WebCodecs `prefer-software` vs `h264enc` bench justifies it: software path in
+   Chrome (`--encoder software`, P1s must keep sha `97aad066…`); slice threads; remaining hot
+   spots (16x16 SATD in the sub-pel search, CABAC `renorm`, `mc_luma`, half-sample
+   interpolation, deblocking). `Preset::Speed` stays opt-in (it changes the output).
+9. **Not started from Phase 1**: a WebCodecs `AudioEncoder` (must signal priming in `edts`), JSPI
+   bridging. **Later** (per the plan): memory64, Wake Lock, Web Locks, notifications, badges.
+10. **Full-length projects**: P2, P3 and P4 (60 min) have never been run; P4 is the streaming /
+    memory criterion. Needs ~5 GB of references and more free disk.
+11. **Housekeeping**: Export CI (`.github/workflows/export-ci.yml`) is green on the push jobs; its
+    nightly full suite will show the two known ui-egui failures until they are fixed. Bench disk:
+    ~7.7 GiB free after deleting `target/debug` and two scratch dirs; `target/release` is 19 GB
+    of build cache (`cargo clean --release` frees it, at the cost of a rebuild).
 
 ## Phase 5 (software H.264 fallback, `crates/h264enc`)
 

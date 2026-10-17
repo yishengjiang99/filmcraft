@@ -66,9 +66,37 @@ vs baseline: P1s 23.6 → 7.1 s (3.3×), UI p95 309 → 42 ms; P2s 168.2 → 133
 slightly (hardware encoder at the same bitrate). The software path (`?softenc` / `encoder:
 software`) is byte-identical to the baseline.
 
+## 2026-10-17: phase 2 (label `phase2b`, `61362d26`)
+
+GPU compositing for export on eframe's WebGPU device (asynchronous read-back ring), lean caches
+during web exports, 4 GiB `mt` heap, Lumetri Look LUT on the GPU, WebCodecs open-GOP start and
+run-ahead pinning. Hardware encoder, OPFS sink; `--compositor gpu` (`gpuRendering: auto`) vs
+`cpu` (`off`) in the same build. Every output validated; every GPU run drew all frames on the GPU.
+
+| config | runs | wall s | fps | realtime | UI p95 ms | LoAF blocking s | wasm peak MiB | render / encode / convert s | Y-PSNR dB (min) |
+|---|---|---|---|---|---|---|---|---|---|
+| P1s-h264-hardware-gpu-opfs-mt | 3+1w | 5.76 ± 0.02 | 31.26 | 1.040 | 116 | 2 | 237 | 2.5 / 1.6 / 1.6 | 48.05 (43.78) |
+| P1s-h264-hardware-cpu-opfs-mt | 3+1w | 7.14 ± 0.03 | 25.23 | 0.840 | 42 | 0 | 473 | 4.5 / 1.6 / 1.6 | 48.09 (43.77) |
+| P2s-h264-hardware-gpu-opfs-mt | 3+1w | 12.83 ± 0.01 | 28.06 | 0.940 | 102 | 4 | 472 | 5.5 / 3.2 / 3.1 | 46.38 (43.18) |
+| P2s-h264-hardware-cpu-opfs-mt | 3+1w | 134.49 ± 0.38 | 2.68 | 0.090 | 658 | 114 | 961 | 129.0 / 3.3 / 3.1 | 47.19 (43.54) |
+| P3s-h264-hardware-gpu-opfs-mt | 3+1w | 24.51 ± 0.46 | 7.34 | 0.240 | 357 | 14 | 813 | 10.2 / 6.6 / 6.3 | 51.32 (48.65) |
+| P3s-h264-hardware-cpu-opfs-mt | – | – | – | – | – | – | – | – | – |
+
+P3s on the CPU compositor did not complete: the benchmark Chrome exited at frame 165 of 180
+(~15.5 min in; no crash report). Not rerun yet.
+
+vs baseline: P1s 23.6 → 5.76 s (4.1×); P2s 168.2 → 12.83 s (13.1×; plan target ≥ 4× met);
+P3s 1118 → 24.51 s (45.6×; target ≥ 6× met). GPU vs CPU compositor in the same build: P1s
+1.24×, P2s 10.5×. Wasm peak −62 % (P1s), −66 % (P2s), −58 % (P3s) vs baseline. UI p95 on the
+GPU path is 102–357 ms (CPU compositor P1s: 42 ms): the GPU path steps in batches of several
+frames; the 20 ms target belongs to phases 4a / 4b. The CPU-compositor rows match phase 1, so
+the lean caches cost nothing there once the decoder's run-ahead is pinned (before `61362d26`
+P1s on the CPU took 22.5 s: 3061 frames decoded for 180).
+
 ## Iteration log
 
 | # | Label | Hypothesis | Result | Decision |
 |---|---|---|---|---|
 | 0 | `baseline` | – (harness + reference numbers) | table above | reference for every later claim |
 | 1 | `phase1` | WebCodecs hardware encode removes the ~100 ms/frame encode: P1s ≥ 3×, P2s ~1.3× (render-bound); streaming cuts wasm memory | P1s 3.3×, P2s 1.26×, wasm −14 % / −30 %, PSNR +0.6–0.7 dB, all valid | kept (`bd13e6c8`) |
+| 2 | `phase2b` | GPU compositing removes the CPU render (P2s 96 % of the time): P2s ≥ 4×, P3s ≥ 2.5× vs phase 1 | P1s 4.1×, P2s 13.1×, P3s 45.6× vs baseline; GPU 10.5× the CPU compositor on P2s; wasm −58–66 %; all valid; UI p95 102–357 ms; P3s CPU row missing (browser exited) | kept (`2ffd57eb`..`61362d26`) |
