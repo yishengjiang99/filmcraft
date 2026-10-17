@@ -54,6 +54,12 @@ const CACHE_FRAMES: usize = 40;
 /// ... while an export runs ([`filmcraft_media::lean`]): it reads each frame once, in order, so
 /// the pictures the decoder runs ahead with are enough (40 4K frames are 500 MB of the heap).
 const LEAN_CACHE_FRAMES: usize = LOOKAHEAD + 8;
+/// A frame asked for this recently is not evicted (`filmcraft_media::cache::evict_far`): an
+/// export waiting for it and a scrubbed monitor on the same source evicted each other's frames
+/// and re-decoded them from the key frame forever.
+const PIN_MS: f64 = 2000.0;
+/// Pinned frames kept beyond the cache size at most.
+const MAX_PINNED: usize = 32;
 /// Chunks allowed in the decoder's queue before feeding pauses.
 const MAX_QUEUE: u32 = 24;
 /// A session that delivered nothing for this long may be restarted by another request.
@@ -260,6 +266,8 @@ struct Config {
 #[derive(Default)]
 struct Cache {
     frames: BTreeMap<i64, Arc<VideoFrame>>,
+    /// Frames asked for, and when (ms): pinned in the cache for [`PIN_MS`].
+    asked: HashMap<i64, f64>,
     failed: bool,
 }
 
@@ -471,7 +479,15 @@ impl WcSource {
             if s.flushing.get() {
                 return Drive::Waiting;
             }
-            let key = t.sync_sample_before(i);
+            // An open-GOP leading picture (stored after its random-access picture, shown before
+            // it: x265's and iPhone HEVC's RASL pictures after a CRA) is predicted from the GOP
+            // before, and a decoder that starts at its random-access picture drops it: start one
+            // GOP earlier (as `filmcraft_codecs`' `decode_start`). Starting at the CRA asked for a
+            // picture that never came, and the export restarted it forever.
+            let mut key = t.sync_sample_before(i);
+            while key > 0 && t.samples.get(i).map(|x| x.pts) < t.samples.get(key).map(|x| x.pts) {
+                key = t.sync_sample_before(key - 1).min(key - 1);
+            }
             // The session reaches the frame by feeding on: it has not output it yet (a frame it
             // already output but the cache dropped needs a restart).
             let covers = !s.needs_key && s.start <= i && key <= s.next && (i >= s.next || want > s.out_max.get());
@@ -554,10 +570,10 @@ impl WcSource {
             c.frames.insert(pts, Arc::new(f));
         }
         let keep = filmcraft_media::lean::cap(CACHE_FRAMES, LEAN_CACHE_FRAMES);
-        while c.frames.len() > keep {
-            let Some(far) = c.frames.keys().copied().max_by_key(|p| (p - want).abs()) else { break };
-            c.frames.remove(&far);
-        }
+        let now = now_ms();
+        c.asked.retain(|_, at| now - *at < PIN_MS);
+        let asked = &c.asked;
+        filmcraft_media::cache::evict_far(&mut c.frames, keep, want, MAX_PINNED, |p| asked.contains_key(&p));
         // the session's own frame came out: other requests may restart it now
         SESSIONS.with(|ss| {
             if let Some(s) = ss.borrow_mut().get_mut(&self.id)
@@ -596,6 +612,11 @@ impl MediaSource for WcSource {
         let target = req.time.max(Tick::ZERO).to_rational_round(1, t.timescale.max(1) as i64);
         let i = t.sample_at_presentation_time(target).unwrap_or(n - 1).min(n - 1);
         let want = t.samples[i].pts;
+        if c.asked.len() < 4 * MAX_PINNED {
+            c.asked.insert(want, now_ms());
+        } else if let Some(at) = c.asked.get_mut(&want) {
+            *at = now_ms();
+        }
         self.collect(&mut c, want);
         if let Some(f) = c.frames.get(&want) {
             return Ok(f.clone());

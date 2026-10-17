@@ -107,8 +107,55 @@ impl<K: Eq + Hash + Clone> FrameCache<K> {
     }
 }
 
+/// Trim a per-source cache of decoded frames (keyed by presentation time) to `keep`, dropping
+/// the frames farthest from `want` (the latest request) first, but never a frame `pinned` says was
+/// asked for recently: two requesters far apart on one source (an export and the scrubbed monitor)
+/// would otherwise evict each other's frame between its decode and its next ask, and re-decode
+/// it from the key frame forever. Pinned frames go too (farthest first) only beyond `keep` +
+/// `max_pinned`, so memory stays bounded whatever asks.
+pub fn evict_far<T>(frames: &mut std::collections::BTreeMap<i64, T>, keep: usize, want: i64, max_pinned: usize, pinned: impl Fn(i64) -> bool) {
+    let far = |k: &i64| k.abs_diff(want);
+    while frames.len() > keep {
+        let free = frames.keys().copied().filter(|k| !pinned(*k)).max_by_key(far);
+        let victim = match free {
+            Some(k) => k,
+            None if frames.len() > keep.saturating_add(max_pinned) => match frames.keys().copied().max_by_key(far) {
+                Some(k) => k,
+                None => break,
+            },
+            None => break,
+        };
+        frames.remove(&victim);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn evict_far_keeps_recently_asked_frames() {
+        use std::collections::BTreeMap;
+        // the export waits for 116; the monitor now scrubs at 30 and its decode filled the cache
+        let mut f: BTreeMap<i64, ()> = (0..40).chain([116]).map(|k| (k, ())).collect();
+        super::evict_far(&mut f, 16, 30, 32, |k| k == 116);
+        assert_eq!(f.len(), 16);
+        assert!(f.contains_key(&116), "the export's frame survived");
+        assert!(f.contains_key(&30));
+        // without pins: the farthest go first, as before
+        let mut f: BTreeMap<i64, ()> = (0..40).chain([116]).map(|k| (k, ())).collect();
+        super::evict_far(&mut f, 16, 30, 32, |_| false);
+        assert!(!f.contains_key(&116));
+        assert_eq!(f.keys().copied().collect::<Vec<_>>(), (22..38).collect::<Vec<_>>());
+        // pins beyond the cap go too, farthest first
+        let mut f: BTreeMap<i64, ()> = (0..100).map(|k| (k, ())).collect();
+        super::evict_far(&mut f, 4, 0, 6, |_| true);
+        assert_eq!(f.len(), 10);
+        assert!(f.contains_key(&0) && !f.contains_key(&99));
+        // hostile keys: no overflow
+        let mut f: BTreeMap<i64, ()> = [i64::MIN, i64::MAX, 0].into_iter().map(|k| (k, ())).collect();
+        super::evict_far(&mut f, 1, i64::MIN, 0, |_| false);
+        assert_eq!(f.keys().copied().collect::<Vec<_>>(), vec![i64::MIN]);
+    }
+
     use super::*;
 
     #[test]
