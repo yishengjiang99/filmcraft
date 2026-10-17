@@ -42,6 +42,7 @@ pub mod adapter;
 pub mod async_export;
 pub mod export_renderer;
 pub mod fx;
+pub mod i420;
 pub mod lut;
 pub mod mask;
 mod transition;
@@ -1127,6 +1128,12 @@ impl GpuCompositor {
     /// Submit recorded commands on the compositor's queue.
     fn submit(&self, enc: wgpu::CommandEncoder) {
         self.queue.submit([enc.finish()]);
+    }
+
+    /// The accumulator's view and size (the last composite, linear premultiplied half floats).
+    fn accumulator_view(&self) -> Option<(&wgpu::TextureView, (u32, u32))> {
+        let (_, v, size) = self.accum.as_ref()?;
+        Some((v, *size))
     }
 
     /// Width, height and read-back row pitch (bytes, 256-aligned) of the accumulator.

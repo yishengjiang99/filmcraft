@@ -427,6 +427,11 @@ impl VideoEncoder for WebCodecsEncoder {
         true
     }
 
+    /// The `VideoFrame` is I420 anyway: a picture the GPU already converted goes in as it is.
+    fn accepts_i420(&self) -> bool {
+        true
+    }
+
     fn encode(&mut self, f: &EncoderFrame) -> filmcraft_export::Result<Vec<EncodedPacket>> {
         self.check_error()?;
         if f.hdr.is_some() {
@@ -436,17 +441,29 @@ impl VideoEncoder for WebCodecsEncoder {
             return Err(ExportError::Encode(format!("picture is {}x{}, the encoder was created for {}x{}", f.width, f.height, self.w, self.h)));
         }
         let (w, h) = (f.width as usize, f.height as usize);
-        if f.rgba.len() < w.saturating_mul(h).saturating_mul(4) {
-            return Err(ExportError::Encode("the RGBA picture is smaller than its size".into()));
-        }
-        filmcraft_export::timed(filmcraft_export::Stage::Convert, || filmcraft_export::rgba_to_yuv420_8(f.rgba, w, h, &mut self.y, &mut self.u, &mut self.v));
         // one I420 buffer (Y, U, V planes back to back), copied into a fresh JS buffer: in the
         // threaded build wasm memory is shared, and a copy also lets the frame outlive this call
-        self.i420.clear();
-        self.i420.extend_from_slice(&self.y);
-        self.i420.extend_from_slice(&self.u);
-        self.i420.extend_from_slice(&self.v);
-        let buf = js_sys::Uint8Array::from(self.i420.as_slice());
+        let buf = match f.i420 {
+            Some(p) => {
+                if filmcraft_export::i420_len(f.width, f.height) != Some(p.len()) {
+                    return Err(ExportError::Encode("the I420 picture does not match its size".into()));
+                }
+                js_sys::Uint8Array::from(p)
+            }
+            None => {
+                if f.rgba.len() < w.saturating_mul(h).saturating_mul(4) {
+                    return Err(ExportError::Encode("the RGBA picture is smaller than its size".into()));
+                }
+                filmcraft_export::timed(filmcraft_export::Stage::Convert, || {
+                    filmcraft_export::rgba_to_yuv420_8(f.rgba, w, h, &mut self.y, &mut self.u, &mut self.v)
+                });
+                self.i420.clear();
+                self.i420.extend_from_slice(&self.y);
+                self.i420.extend_from_slice(&self.u);
+                self.i420.extend_from_slice(&self.v);
+                js_sys::Uint8Array::from(self.i420.as_slice())
+            }
+        };
         let timestamp = (f.index as f64 * self.frame_us).round();
         let init = obj(&[
             ("format", "I420".into()),

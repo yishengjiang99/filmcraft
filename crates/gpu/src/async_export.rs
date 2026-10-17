@@ -36,6 +36,9 @@ pub const MAP_TIMEOUT_POLLS: u32 = 30;
 /// and a whole 4K frame would be a 66 MB copy (on a 2 GiB heap).
 const BAND_ROWS: u32 = 64;
 
+/// Largest staging buffer (one frame) the renderer makes: an 8K half-float frame is 254 MiB.
+const MAX_STAGING: u64 = 1 << 30;
+
 /// Staging buffers kept at most, whatever the memory budget allows.
 const MAX_SLOTS: usize = 16;
 
@@ -54,8 +57,10 @@ struct Slot {
     buf: wgpu::Buffer,
     /// Frame key (the frame's tick) while in use.
     key: Option<i64>,
-    /// (width, height, row pitch) of the copy.
+    /// (width, height, row pitch) of the copy (row pitch 0: an I420 picture).
     layout: (u32, u32, u32),
+    /// The slot holds an I420 picture ([`AsyncExportRenderer::set_i420`]), not half-float rows.
+    i420: bool,
     state: Arc<AtomicU8>,
     since: web_time::Instant,
     /// Times it was looked at while still mapping.
@@ -69,6 +74,9 @@ struct Slot {
 pub enum AsyncFrame {
     /// The frame as `render_sequence` would return it (premultiplied linear-light RGBA).
     Ready(Image),
+    /// In I420 mode: the frame flattened over black as BT.709 limited-range I420 (Y, U, V back to
+    /// back), as the CPU's `over_black_rgba8` + `rgba_to_yuv420_8` give it within one code value.
+    ReadyI420 { w: u32, h: u32, data: Vec<u8> },
     /// Submitted, not back yet: ask again later.
     Pending,
     /// Not for the GPU (transitions, a failed renderer): render it on the CPU.
@@ -78,11 +86,14 @@ pub enum AsyncFrame {
 /// Export frames composited on a borrowed device and read back asynchronously.
 pub struct AsyncExportRenderer {
     device: wgpu::Device,
+    queue: wgpu::Queue,
     compositor: GpuCompositor,
     slots: Vec<Slot>,
     /// Bytes the staging buffers may take together.
     budget: u64,
     failed: Option<String>,
+    /// I420 output ([`set_i420`](Self::set_i420)).
+    i420: Option<crate::i420::I420Stage>,
     /// Frames collected (stats).
     pub collected: u64,
     /// Sum and maximum of the time from submission to collection (stats).
@@ -98,10 +109,12 @@ impl AsyncExportRenderer {
         compositor.set_upload_cache(8);
         Self {
             device: device.clone(),
+            queue: queue.clone(),
             compositor,
             slots: Vec::new(),
             budget,
             failed: None,
+            i420: None,
             collected: 0,
             latency_total: std::time::Duration::ZERO,
             latency_max: std::time::Duration::ZERO,
@@ -118,10 +131,27 @@ impl AsyncExportRenderer {
         self.compositor.has_effect_stage()
     }
 
+    /// Read frames back as I420 ([`AsyncFrame::ReadyI420`]) instead of half-float RGBA: for an
+    /// export whose encoder takes I420 and whose frames need no CPU step after compositing.
+    /// Answers whether the mode is on. Set before the first frame (slots already holding RGBA
+    /// frames are not converted).
+    pub fn set_i420(&mut self, on: bool) -> bool {
+        self.i420 = on.then(|| crate::i420::I420Stage::new(&self.device, &self.queue));
+        self.i420.is_some()
+    }
+
+    /// Bytes one staging buffer needs for a `w`×`h` frame in the current mode.
+    fn frame_bytes(&self, w: u32, h: u32) -> u64 {
+        if self.i420.is_some() {
+            return crate::i420::i420_padded(w, h).unwrap_or(u64::MAX);
+        }
+        let row = u64::from(w).saturating_mul(8).div_ceil(256).saturating_mul(256);
+        row.saturating_mul(u64::from(h))
+    }
+
     /// Frames that can be in flight at once for a `w`×`h` render (staging buffers the budget allows).
     pub fn frames_in_flight(&self, w: u32, h: u32) -> usize {
-        let row = u64::from(w).saturating_mul(8).div_ceil(256).saturating_mul(256);
-        let bytes = row.saturating_mul(u64::from(h)).max(1);
+        let bytes = self.frame_bytes(w, h).max(1);
         usize::try_from(self.budget / bytes).unwrap_or(MAX_SLOTS).clamp(2, MAX_SLOTS)
     }
 
@@ -242,18 +272,25 @@ impl AsyncExportRenderer {
         let prep = prepare(plan);
         self.compositor.render_plan(plan, Some(&prep), true, false);
         let layout = self.compositor.accumulator_layout();
+        let i420 = self.i420.is_some();
+        // bytes the frame needs in a staging buffer; an unusable size retires the renderer
+        let needed = layout.map(|(w, h, _)| self.frame_bytes(w, h)).filter(|n| *n <= MAX_STAGING);
+        if layout.is_some() && needed.is_none() {
+            self.fail("the frame is too large to read back".into());
+            return false;
+        }
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("filmcraft-composite-export-async") });
-        let slot = match (layout, free) {
-            (Some(_), Some(i)) if self.slots.get(i).is_some_and(|s| s.buf.size() >= Self::bytes(layout)) => Some(i),
-            (Some((w, h, row)), _) => {
+        let slot = match (layout, needed, free) {
+            (Some(_), Some(n), Some(i)) if self.slots.get(i).is_some_and(|s| s.buf.size() >= n) => Some(i),
+            (Some((w, h, row)), Some(n), _) => {
                 // a new (or larger) staging buffer
                 let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("accum-readback-async"),
-                    size: u64::from(row).saturating_mul(u64::from(h)).max(4),
+                    size: n.max(4),
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                     mapped_at_creation: false,
                 });
-                let s = Slot { buf, key: None, layout: (w, h, row), state: Arc::new(AtomicU8::new(IDLE)), since: t, polls: 0, scopes: Vec::new() };
+                let s = Slot { buf, key: None, layout: (w, h, row), i420, state: Arc::new(AtomicU8::new(IDLE)), since: t, polls: 0, scopes: Vec::new() };
                 match free {
                     Some(i) if i < self.slots.len() => {
                         if let Some(old) = self.slots.get_mut(i) {
@@ -268,9 +305,18 @@ impl AsyncExportRenderer {
                     }
                 }
             }
+            _ => None,
+        };
+        let copied = match (slot.and_then(|i| self.slots.get(i)), self.i420.as_mut()) {
+            // I420: converted on the GPU, straight into the staging buffer
+            (Some(s), Some(stage)) => self
+                .compositor
+                .accumulator_view()
+                .filter(|(view, size)| stage.record(&self.device, &self.queue, &mut enc, view, *size, &s.buf))
+                .map(|(_, (w, h))| (w, h, 0)),
+            (Some(s), None) => self.compositor.copy_accumulator_into(&mut enc, &s.buf),
             (None, _) => None,
         };
-        let copied = slot.and_then(|i| self.slots.get(i)).and_then(|s| self.compositor.copy_accumulator_into(&mut enc, &s.buf));
         self.compositor.submit(enc);
         let scopes: Vec<ScopeAnswer> = vec![Box::pin(memory.pop()), Box::pin(validation.pop())];
         crate::export_renderer::timing::add_submit(t.elapsed());
@@ -283,6 +329,7 @@ impl AsyncExportRenderer {
         let Some(s) = self.slots.get_mut(i) else { return false };
         s.key = Some(key);
         s.layout = layout;
+        s.i420 = i420;
         s.since = web_time::Instant::now();
         s.polls = 0;
         s.scopes = scopes;
@@ -329,8 +376,23 @@ impl AsyncExportRenderer {
         }
     }
 
-    fn bytes(layout: Option<(u32, u32, u32)>) -> u64 {
-        layout.map_or(u64::MAX, |(_, h, row)| u64::from(row).saturating_mul(u64::from(h)))
+    /// The mapped I420 picture of `buf` (its first [`crate::i420::i420_len`] bytes), copied out a
+    /// band at a time (on WebGPU each mapped range is a copy into wasm memory).
+    fn i420_bytes(buf: &wgpu::Buffer, w: u32, h: u32) -> Option<Vec<u8>> {
+        let len = crate::i420::i420_len(w, h)?;
+        if len == 0 || buf.size() < len {
+            return None;
+        }
+        const BAND: u64 = 4 << 20;
+        let mut out = Vec::with_capacity(usize::try_from(len).ok()?);
+        let mut at = 0u64;
+        while at < len {
+            let end = at.saturating_add(BAND).min(len);
+            let data = buf.slice(at..end).get_mapped_range().ok()?;
+            out.extend_from_slice(&data);
+            at = end;
+        }
+        Some(out)
     }
 
     /// Let a native device run its callbacks (the web's run on the event loop by themselves).
@@ -389,18 +451,22 @@ impl AsyncExportRenderer {
         let t = web_time::Instant::now();
         let (w, h, row) = s.layout;
         let latency = s.since.elapsed();
-        let px = Self::convert(&s.buf, w, h, row);
+        let out = if s.i420 {
+            Self::i420_bytes(&s.buf, w, h).map(|data| AsyncFrame::ReadyI420 { w, h, data })
+        } else {
+            Self::convert(&s.buf, w, h, row).map(|px| AsyncFrame::Ready(Image { w: w as usize, h: h as usize, px }))
+        };
         s.buf.unmap();
         s.state.store(IDLE, Ordering::Release);
         s.key = None;
         crate::export_renderer::timing::add_convert(t.elapsed());
-        match px {
-            Some(px) => {
+        match out {
+            Some(frame) => {
                 crate::export_renderer::timing::add_frame();
                 self.collected += 1;
                 self.latency_total += latency;
                 self.latency_max = self.latency_max.max(latency);
-                AsyncFrame::Ready(Image { w: w as usize, h: h as usize, px })
+                frame
             }
             None => {
                 self.fail("the read-back was short".into());

@@ -868,6 +868,10 @@ pub struct EncoderFrame<'a> {
     pub height: u32,
     pub rgba: &'a [u8],
     pub hdr: Option<&'a [f32]>,
+    /// The picture as BT.709 limited-range 8-bit I420 (Y, U, V back to back, chroma rounded up),
+    /// exactly what [`rgba_to_yuv420_8`] makes of `rgba`, which is then empty. Only for encoders
+    /// that say they take it ([`VideoEncoder::accepts_i420`]).
+    pub i420: Option<&'a [u8]>,
     pub index: u64,
 }
 
@@ -884,6 +888,12 @@ pub trait VideoEncoder: Send {
     /// First-pass statistics of a two-pass encode (H.264).
     fn pass_stats(&self) -> Option<filmcraft_h264enc::PassStats> {
         None
+    }
+    /// Takes SDR pictures as I420 ([`EncoderFrame::i420`]) instead of RGBA: the exporter then hands
+    /// them over in that form when it can make them without an RGBA step (a GPU renderer that
+    /// converts on the GPU, [`FrameRenderer::set_i420`]).
+    fn accepts_i420(&self) -> bool {
+        false
     }
     /// A hardware encoder (VideoToolbox, NVENC, the browser's WebCodecs encoder): an export that
     /// requires one ([`ExportSettings::require_hardware`]) fails when the encoder made is not.
@@ -1105,6 +1115,13 @@ pub trait FrameRenderer: Send {
     fn frames_in_flight(&self, _width: u32, _height: u32) -> usize {
         1
     }
+
+    /// Answer [`FrameOutcome::ReadyI420`] (the picture flattened over black as BT.709 I420)
+    /// instead of [`FrameOutcome::Ready`] from now on. Whether this renderer can: the default
+    /// cannot, and keeps answering RGBA.
+    fn set_i420(&mut self, _on: bool) -> bool {
+        false
+    }
 }
 
 /// What [`FrameRenderer::render_async`] came to for one frame.
@@ -1112,6 +1129,9 @@ pub trait FrameRenderer: Send {
 pub enum FrameOutcome {
     /// The frame, as [`filmcraft_render::render_sequence`] would return it.
     Ready(filmcraft_render::Image),
+    /// After [`FrameRenderer::set_i420`]: the frame flattened over black as BT.709 limited-range
+    /// I420 (Y, U, V back to back), within one code value of what the CPU path makes of it.
+    ReadyI420 { w: u32, h: u32, data: Vec<u8> },
     /// Submitted, not finished yet: ask again on a later step.
     Pending,
     /// Not for this renderer (a plan it cannot draw, an error, a lost device): the CPU renders it.
@@ -1799,6 +1819,23 @@ pub fn rgba_to_yuv420_8(rgba: &[u8], w: usize, h: usize, y: &mut Vec<u8>, u: &mu
             vr[cx] = (128.0 + 224.0 * vs[cx] / cnt[cx]).round().clamp(1.0, 254.0) as u8;
         }
     });
+}
+
+/// Bytes of a `w`×`h` I420 picture (Y, then U and V at half size, rounded up).
+pub fn i420_len(w: u32, h: u32) -> Option<usize> {
+    let (w, h) = (w as usize, h as usize);
+    let c = w.div_ceil(2).checked_mul(h.div_ceil(2))?;
+    w.checked_mul(h)?.checked_add(c.checked_mul(2)?)
+}
+
+/// [`rgba_to_yuv420_8`] as one I420 buffer (Y, U, V back to back).
+pub fn rgba_to_i420(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+    rgba_to_yuv420_8(rgba, w, h, &mut y, &mut u, &mut v);
+    y.reserve(u.len() + v.len());
+    y.extend_from_slice(&u);
+    y.extend_from_slice(&v);
+    y
 }
 
 /// Limited-range 8-bit 4:2:0 from encoded R'G'B' floats with matrix (Kr, Kb).

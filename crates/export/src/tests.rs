@@ -504,7 +504,124 @@ fn gpu_hook_scenarios() {
     let (failed_file, _) = run("shade-async-fail.mov");
     ASYNC.with(|a| assert_eq!(a.borrow().collected, 10, "no frame is collected after the failure"));
     assert_ne!(failed_file, async_file, "the frames after the failure are the CPU's");
+
+    // 7. I420 mode: an encoder that takes I420 and a renderer that converts on the GPU get every
+    //    frame as I420 (RGBA empty): the renderer's own, and for the frames it declines exactly
+    //    what the CPU path makes of the CPU's picture. A video limiter (a CPU step after
+    //    compositing) keeps the export on RGBA.
     crate::reset_frame_renderers_for_tests();
+    crate::register_encoder(i420_encoder_factory);
+    crate::register_frame_renderer(|| Some(Box::new(I420ShadeRenderer { on: false }) as Box<dyn FrameRenderer>));
+    let run_i420 = |path: &str, limiter: bool| -> Vec<SeenFrame> {
+        SEEN.lock().unwrap().clear();
+        let mut s = ExportSettings { format: Format::Mjpeg, path: tmp(path), gpu_rendering: crate::GpuRendering::Auto, ..Default::default() };
+        s.range = Some(TimeRange::new(Tick::ZERO, FrameRate::FPS_24.tick_of(24)));
+        s.effects.video_limiter.enabled = limiter;
+        s.effects.video_limiter.max_percent = 100.0;
+        let prog = Progress::default();
+        let mut ex = crate::Exporter::new(p.clone(), seq, &s, &prog).unwrap();
+        ex.set_overlap(false);
+        for _ in 0..10_000 {
+            if let crate::Step::Done(_) = ex.step(&m, &prog).unwrap() {
+                return std::mem::take(&mut *SEEN.lock().unwrap());
+            }
+        }
+        panic!("the export did not finish");
+    };
+    let seen = run_i420("i420-enc.mov", false);
+    assert_eq!(seen.len(), 24);
+    for f in &seen {
+        let t = FrameRate::FPS_24.tick_of(f.index as i64);
+        assert_eq!(f.rgba_len, 0, "frame {}: RGBA alongside I420", f.index);
+        let i420 = f.i420.as_ref().unwrap_or_else(|| panic!("frame {} came as RGBA", f.index));
+        let want = if I420ShadeRenderer::declines(t) {
+            let cpu = filmcraft_render::render_sequence(&p, seq, t, filmcraft_render::RenderOptions::default(), &m);
+            crate::rgba_to_i420(&cpu.over_black_rgba8(), cpu.w, cpu.h)
+        } else {
+            let img = shade(t);
+            crate::rgba_to_i420(&img.over_black_rgba8(), img.w, img.h)
+        };
+        assert!(*i420 == want, "frame {}: not the expected I420 picture", f.index);
+    }
+    let seen = run_i420("i420-enc-limited.mov", true);
+    assert!(seen.iter().all(|f| f.i420.is_none() && f.rgba_len == 320 * 180 * 4), "a limiter keeps the export on RGBA");
+    crate::reset_frame_renderers_for_tests();
+}
+
+/// What the I420-taking test encoder was given.
+struct SeenFrame {
+    index: u64,
+    i420: Option<Vec<u8>>,
+    rgba_len: usize,
+}
+
+static SEEN: std::sync::Mutex<Vec<SeenFrame>> = std::sync::Mutex::new(Vec::new());
+
+/// MJPEG under a path containing `i420-enc`, taking I420 (it records what it gets and encodes
+/// grey: the file is not what is tested).
+fn i420_encoder_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Option<crate::Result<Box<dyn crate::VideoEncoder>>> {
+    if format != Format::Mjpeg || !s.path.contains("i420-enc") {
+        return None;
+    }
+    let inner = crate::mjpeg_factory(format, w, h, rate, s)?.ok()?;
+    Some(Ok(Box::new(I420Recorder { inner, grey: vec![128; (w * h * 4) as usize] })))
+}
+
+struct I420Recorder {
+    inner: Box<dyn crate::VideoEncoder>,
+    grey: Vec<u8>,
+}
+
+impl crate::VideoEncoder for I420Recorder {
+    fn sample_entry(&self) -> crate::SampleEntry {
+        self.inner.sample_entry()
+    }
+    fn timescale(&self) -> u32 {
+        self.inner.timescale()
+    }
+    fn accepts_i420(&self) -> bool {
+        true
+    }
+    fn encode(&mut self, f: &crate::EncoderFrame) -> crate::Result<Vec<crate::EncodedPacket>> {
+        SEEN.lock().unwrap().push(SeenFrame { index: f.index, i420: f.i420.map(<[u8]>::to_vec), rgba_len: f.rgba.len() });
+        self.inner.encode(&crate::EncoderFrame { width: f.width, height: f.height, rgba: &self.grey, hdr: None, i420: None, index: f.index })
+    }
+    fn flush(&mut self) -> crate::Result<Vec<crate::EncodedPacket>> {
+        self.inner.flush()
+    }
+}
+
+/// [`shade`] pictures, answered as I420 once asked to; every third frame is declined (the CPU
+/// renders it).
+struct I420ShadeRenderer {
+    on: bool,
+}
+
+impl I420ShadeRenderer {
+    fn declines(t: Tick) -> bool {
+        (t.0 / (TICKS_PER_SECOND / 24)) % 3 == 2
+    }
+}
+
+impl FrameRenderer for I420ShadeRenderer {
+    fn render(&mut self, _: &Project, _: ItemId, t: Tick, _: filmcraft_render::RenderOptions, _: &dyn SourceProvider) -> Option<filmcraft_render::Image> {
+        (!Self::declines(t)).then(|| shade(t))
+    }
+
+    fn render_async(&mut self, p: &Project, seq: ItemId, t: Tick, o: filmcraft_render::RenderOptions, s: &dyn SourceProvider) -> crate::FrameOutcome {
+        match self.render(p, seq, t, o, s) {
+            Some(img) if self.on => {
+                crate::FrameOutcome::ReadyI420 { w: img.w as u32, h: img.h as u32, data: crate::rgba_to_i420(&img.over_black_rgba8(), img.w, img.h) }
+            }
+            Some(img) => crate::FrameOutcome::Ready(img),
+            None => crate::FrameOutcome::Declined,
+        }
+    }
+
+    fn set_i420(&mut self, on: bool) -> bool {
+        self.on = on;
+        true
+    }
 }
 
 /// Pictures that depend on the frame time (a grey level), so out-of-order frames would show.

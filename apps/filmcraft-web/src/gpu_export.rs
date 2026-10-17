@@ -109,6 +109,7 @@ impl FrameRenderer for Handle {
     fn render_async(&mut self, project: &Project, seq: ItemId, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider) -> FrameOutcome {
         match self.with(|r| r.render(project, seq, t, opts, sources, &incomplete)) {
             Some(AsyncFrame::Ready(img)) => FrameOutcome::Ready(img),
+            Some(AsyncFrame::ReadyI420 { w, h, data }) => FrameOutcome::ReadyI420 { w, h, data },
             Some(AsyncFrame::Pending) => {
                 // the read-back completes on the event loop: ask for the next UI frame
                 crate::repaint();
@@ -124,6 +125,10 @@ impl FrameRenderer for Handle {
 
     fn frames_in_flight(&self, width: u32, height: u32) -> usize {
         self.with(|r| r.frames_in_flight(width, height)).unwrap_or(1)
+    }
+
+    fn set_i420(&mut self, on: bool) -> bool {
+        self.with(|r| r.set_i420(on)).unwrap_or(false)
     }
 }
 

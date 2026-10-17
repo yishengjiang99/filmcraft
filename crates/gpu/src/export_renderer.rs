@@ -341,6 +341,7 @@ mod tests {
                     }
                     crate::AsyncFrame::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
                     crate::AsyncFrame::Declined => panic!("declined: {:?}", a.failed()),
+                    crate::AsyncFrame::ReadyI420 { .. } => panic!("I420 although the mode is off"),
                 }
             }
             let got = got.expect("the read-back finished");
@@ -360,9 +361,59 @@ mod tests {
                 }
                 crate::AsyncFrame::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
                 crate::AsyncFrame::Declined => panic!("declined"),
+                crate::AsyncFrame::ReadyI420 { .. } => panic!("I420 although the mode is off"),
             }
         }
         assert!(done);
+    }
+
+    /// In I420 mode the GPU's picture is what the CPU makes of the synchronous renderer's frame
+    /// (`over_black_rgba8` then `rgba_to_yuv420_8`): every byte within one code value (f32 order
+    /// of operations), nearly all exact; and five times more frames fit in the staging budget.
+    #[test]
+    fn async_i420_matches_cpu_conversion() {
+        let Some((_, device, queue)) = shared_device() else {
+            eprintln!("SKIPPED (gpu async I420): no adapter");
+            return;
+        };
+        let Some(mut sync) = ExportRenderer::new() else { return };
+        let (p, seq, m) = project(true);
+        let r = filmcraft_time::FrameRate::FPS_24;
+        let budget = (320u64 * 8).div_ceil(256) * 256 * 180 * 3;
+        let mut a = crate::AsyncExportRenderer::new(&device, &queue, budget);
+        let rgba_slots = a.frames_in_flight(320, 180);
+        assert!(a.set_i420(true));
+        assert!(a.frames_in_flight(320, 180) >= rgba_slots * 4, "I420 slots are ~5x smaller");
+        let no = || false;
+        let (mut worst, mut off, mut total) = (0u8, 0usize, 0usize);
+        for f in [0, 7, 15] {
+            let t = r.tick_of(f);
+            let want = sync.render(&p, seq, t, RenderOptions::default(), &m).expect("sync GPU frame");
+            let want = filmcraft_export::rgba_to_i420(&want.over_black_rgba8(), want.w, want.h);
+            let mut got = None;
+            for _ in 0..2_000 {
+                match a.render(&p, seq, t, RenderOptions::default(), &m, &no) {
+                    crate::AsyncFrame::ReadyI420 { w, h, data } => {
+                        assert_eq!((w, h), (320, 180));
+                        got = Some(data);
+                        break;
+                    }
+                    crate::AsyncFrame::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    other => panic!("frame {f}: {other:?} ({:?})", a.failed()),
+                }
+            }
+            let got = got.expect("the read-back finished");
+            assert_eq!(got.len(), want.len());
+            for (g, w) in got.iter().zip(&want) {
+                let d = g.abs_diff(*w);
+                worst = worst.max(d);
+                off += usize::from(d > 0);
+            }
+            total += want.len();
+        }
+        eprintln!("GPU I420 vs CPU: max diff {worst}, {off} of {total} bytes off");
+        assert!(worst <= 1, "max difference {worst} code values");
+        assert!(off * 100 <= total, "{off} of {total} bytes differ");
     }
 
     #[test]

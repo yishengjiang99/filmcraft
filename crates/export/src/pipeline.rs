@@ -105,6 +105,25 @@ impl RendererPool {
     }
 }
 
+impl RendererPool {
+    /// Run `f` on every renderer (at setup, when none is taken); whether it answered true for all.
+    fn all(&self, mut f: impl FnMut(&mut dyn FrameRenderer) -> bool) -> bool {
+        let mut free = self.renderers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if free.is_empty() || self.failed.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        // every renderer is asked, also after one said no (none may be left half switched)
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut ok = true;
+            for r in free.iter_mut() {
+                ok &= f(&mut **r);
+            }
+            ok
+        }));
+        res.unwrap_or(false)
+    }
+}
+
 /// The immutable part of an export: everything needed to produce one output frame.
 pub(crate) struct Pipeline {
     pub project: Arc<Project>,
@@ -133,6 +152,8 @@ pub(crate) struct Pipeline {
     /// Free the pool's float images when the export ends: a standalone export, not one part of a
     /// batch (`ExportSettings::part_of_batch`).
     trim_pool: bool,
+    /// Frames come out as BT.709 I420 ([`Self::enable_i420`]) instead of RGBA8.
+    pub i420: bool,
 }
 
 impl Drop for Pipeline {
@@ -199,6 +220,7 @@ impl Pipeline {
             start_tc: q.start_timecode,
             drop_frame: q.settings.drop_frame,
             trim_pool: !settings.part_of_batch,
+            i420: false,
             project: project.clone(),
             seq,
             rate: r.rate,
@@ -240,6 +262,17 @@ impl Pipeline {
             None => FrameOutcome::Declined,
         };
         let img = match gpu {
+            FrameOutcome::ReadyI420 { w, h, data } if self.i420 && (w, h) == (self.w, self.h) && crate::i420_len(w, h).is_some_and(|n| n == data.len()) => {
+                note_gpu_frame();
+                crate::note_export_frame(true);
+                return (data, Vec::new());
+            }
+            FrameOutcome::ReadyI420 { .. } => {
+                // not in I420 mode, or the wrong size: the CPU is the reference
+                note_gpu_fallback();
+                crate::note_export_frame(false);
+                filmcraft_render::render_sequence(&self.project, self.seq, t, self.opts, sources)
+            }
             FrameOutcome::Ready(img) => {
                 note_gpu_frame();
                 crate::note_export_frame(true);
@@ -280,7 +313,33 @@ impl Pipeline {
         if lim.enabled {
             limit_rgba8(&mut rgba, lim.min_percent, lim.max_percent);
         }
+        if self.i420 {
+            return (crate::rgba_to_i420(&rgba, self.w as usize, self.h as usize), Vec::new());
+        }
         (rgba, Vec::new())
+    }
+
+    /// Hand frames out as BT.709 limited-range I420 (for an encoder that takes it): only when the
+    /// GPU renderers can convert their pictures themselves and nothing happens to a picture after
+    /// compositing (no resize or placement, overlays, limiter, alpha or HDR), so the GPU's I420 is
+    /// the picture. Frames the GPU declines are converted on the CPU ([`rgba_to_i420`]), so every
+    /// frame of the export has the same form. Whether the export runs in I420 mode.
+    pub fn enable_i420(&mut self) -> bool {
+        let as_rendered = self.geom.content.is_none_or(|c| c == (self.render_w as usize, self.render_h as usize))
+            && self.geom.offset == (0, 0)
+            && (self.render_w, self.render_h) == (self.w, self.h);
+        let plain = !self.hdr_out && !self.alpha && !self.effects.any_video() && self.overlay.is_none();
+        let Some(pool) = self.renderer.as_ref().filter(|_| as_rendered && plain) else { return false };
+        let on = pool.all(|r| r.set_i420(true));
+        if !on {
+            // some could not: every renderer back to RGBA
+            pool.all(|r| {
+                r.set_i420(false);
+                true
+            });
+        }
+        self.i420 = on;
+        on
     }
 
     /// Frames the GPU renderer can keep in flight (1 = synchronous or none, see

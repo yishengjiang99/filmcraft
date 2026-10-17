@@ -291,8 +291,7 @@ impl Exporter {
         let two_pass = settings.video_format() == Format::H264 && settings.bitrate_mode == BitrateMode::Vbr2Pass;
         settings.h264_pass = if two_pass { H264Pass::First } else { H264Pass::Single };
         let range = export_range(&project, seq, &settings)?;
-        let pipe = Arc::new(Pipeline::new(project.clone(), seq, &settings, hdr_out)?);
-        let in_flight = pipe.frames_in_flight();
+        let mut pipe = Pipeline::new(project.clone(), seq, &settings, hdr_out)?;
         let (f0, f1) = frame_span(pipe.rate, range);
         let nframes = (f1 - f0) as u64;
         if !settings.part_of_batch {
@@ -300,6 +299,12 @@ impl Exporter {
             progress.set_status(format!("Exporting {} frames ({})", nframes, settings.format.label()));
         }
         let venc = make_venc(&settings, pipe.w, pipe.h, pipe.rate)?;
+        // an encoder that takes I420 gets it straight from a GPU renderer that converts on the GPU
+        if venc.accepts_i420() {
+            pipe.enable_i420();
+        }
+        let pipe = Arc::new(pipe);
+        let in_flight = pipe.frames_in_flight();
         let brand = if settings.format.is_mp4_with(settings.multiplexer) { Brand::Mp4 } else { Brand::Mov };
         let audio = if settings.has_audio() { Some(AudioOut::new(project.clone(), seq, &settings, range)?) } else { None };
         let aenc: Option<Box<dyn AudioEncoder>> = match (&audio, settings.audio_codec()) {
@@ -537,6 +542,9 @@ impl Exporter {
             let stats = self.venc.pass_stats().ok_or_else(|| ExportError::Encode("two-pass statistics missing".into()))?;
             self.settings.h264_pass = H264Pass::Second(stats);
             self.venc = make_venc(&self.settings, self.pipe.w, self.pipe.h, self.pipe.rate)?;
+            if self.pipe.i420 && !self.venc.accepts_i420() {
+                return Err(ExportError::Encode("the second-pass encoder does not take the I420 pictures of the first".into()));
+            }
             self.first_pass = false;
             self.next = self.f0;
             return Ok(Step::Progress);
@@ -739,11 +747,13 @@ impl Exporter {
     fn encode(&mut self, frames: &[(Vec<u8>, Vec<f32>)], f: i64) -> Result<Vec<EncodedPacket>> {
         let mut packets = Vec::new();
         for (k, (rgba, hdr)) in frames.iter().enumerate() {
+            let i420 = self.pipe.i420;
             let fr = EncoderFrame {
                 width: self.pipe.w,
                 height: self.pipe.h,
-                rgba,
+                rgba: if i420 { &[] } else { rgba },
                 hdr: self.pipe.hdr_out.then_some(hdr.as_slice()),
+                i420: i420.then_some(rgba.as_slice()),
                 index: (f - self.f0) as u64 + k as u64,
             };
             packets.extend(self.venc.encode(&fr)?);
