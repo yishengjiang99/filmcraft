@@ -1,7 +1,7 @@
 # Handoff: GPU-first, hardware-encoded, streaming web export
 
 Status of the work on [`export-optimize-gpu.md`](export-optimize-gpu.md) (the plan) as of
-2026-10-17 (evening). Numbers: [`benchmarks/web-export.md`](benchmarks/web-export.md); every number there
+2026-10-17 (night). Numbers: [`benchmarks/web-export.md`](benchmarks/web-export.md); every number there
 cites a `target/web-bench/results.jsonl` line (label + git sha) on the bench machine.
 
 ## Where it stands
@@ -13,7 +13,7 @@ cites a `target/web-bench/results.jsonl` line (label + git sha) on the bench mac
 | §2.4 baseline | short projects (P1s/P2s/P3s) + full P1 measured; full P2/P3/P4 not run (see "Baseline") |
 | Phase 1 WebCodecs hardware encoder | done, committed (`bd13e6c8`); measured on P1s/P2s (below) |
 | Phase 3 streaming output (OPFS / Blob) | streaming done (`bd13e6c8`; OPFS + Blob sinks validated); in the revised plan this is part of **3a**, whose missing piece is backpressure (`export-sink.js` queues writes on an unbounded promise chain) and fMP4 for unseekable sinks |
-| Phase 2 GPU compositing for export | **working and timed on `main`** (`2ffd57eb`..`61362d26`, label `phase2b`): P1s 4.1×, P2s 13.1×, P3s 45.6× vs baseline, all frames on the GPU, all outputs valid; P3s on the CPU compositor not timed (browser exited); remaining items under "Phase 2 state" |
+| Phase 2 GPU compositing for export | **working and timed on `main`** (`2ffd57eb`..`32baa127`, labels `phase2b`, `i420`): with the GPU RGB→YUV pass P1s 2.54 s (9.3×), P2s 4.80 s (35×), P3s 10.09 s (111×) vs baseline, all frames on the GPU, all outputs valid; remaining items under "Phase 2 state" |
 | Phase 4 off the main thread | not started; the revised plan splits it into **4a** (cooperative `scheduler.yield` pump) and **4b** (export worker) |
 | Phase 5 simd128 in `h264enc` | done, on `main` (`5a5e4e79`..`64348228`): software encoder 1.9x faster on wasm (node), 1.75x native, bytes unchanged; Chrome export + P1s sha check not yet run |
 
@@ -88,15 +88,21 @@ node apps/filmcraft-web/tests/bench-compare.mjs --baseline baseline --doc docs/b
 FILMCRAFT_FFMPEG=/opt/homebrew/bin/ffmpeg FILMCRAFT_FFPROBE=/opt/homebrew/bin/ffprobe cargo xtask ci
 ```
 
+## CI
+
+Export CI's three failures were fixed in `f124b8c3`: the flaky
+`async_encoder_tests::a_blocking_export_explains_an_asynchronous_encoder` (a process-wide
+`FAIL_AFTER` static shared with the failing-encoder test; now per encoder), the Linux dev desktop
+entry missing the `MimeType` line the packaged one gained in `69a6c4b6`, and
+`graphics::windows_default_leaves_out_gl` assuming eframe's default backends while Export CI sets
+`WGPU_BACKEND=vulkan`.
+
 ## Known unrelated failures
 
 - `filmcraft-ui-egui` `tests/graphics_notice_ui.rs` `the_notice_follows_the_interface_language`
   (expects Spanish "renderizado por software", gets "procesamiento por software") and
   `tests/timeline_marquee_ui.rs` `alt_box_selects_only_video_and_delete_keeps_linked_audio`
   ("release preserves the individual selection") fail on `2ffd57eb` without this work too.
-- `filmcraft-export` `async_encoder_tests::a_blocking_export_explains_an_asynchronous_encoder` is
-  flaky in the full crate run (a process-wide encoder registry shared with other tests); it
-  passes alone.
 
 `cargo test --workspace` fails one ffmpeg oracle test with Homebrew ffmpeg/ffprobe 8.x:
 `filmcraft-matroska` `tests/oracle.rs` `mjpeg_ac3` ("packet 56 (track 1): duration ffprobe 32 vs 8",
@@ -167,6 +173,20 @@ table in [`benchmarks/web-export.md`](benchmarks/web-export.md)):
 
 Plan targets: P2 ≥ 4× and P3 ≥ 6× met (on the short cuts); UI p95 ≤ 20 ms not met.
 
+Then `32baa127` (label `i420`) moved RGB→YUV onto the GPU: `crates/gpu/src/i420.wgsl` converts
+the accumulator to BT.709 I420 (the CPU's sRGB table, round half away from zero; 0 bytes differ
+from the CPU in `async_i420_matches_cpu_conversion`), the staging ring reads back 1.5 B/px
+instead of 8, and encoders that say `accepts_i420` (WebCodecs) take it as it is. The exporter
+turns it on only when nothing follows compositing (no resize/placement, overlay, limiter,
+alpha, HDR); frames the GPU declines are converted on the CPU, so an export never mixes forms.
+Timed on **Chrome 155.0.8059.84** (the bench Chrome auto-updated from .40; the harness warns):
+
+| project | `phase2b` s | `i420` s | gain | UI p95 ms | wasm peak MiB |
+|---|---|---|---|---|---|
+| P1s | 5.76 | 2.54 ± 0.00 | 2.27× | 116 → 16 | 237 → 160 |
+| P2s | 12.83 | 4.80 ± 0.10 | 2.68× | 102 → 25 | 472 → 387 |
+| P3s | 24.51 | 10.09 ± 0.04 | 2.43× | 357 → 91 | 813 → 655 |
+
 P3s stage times (GPU, median): render 10.2 s, encode 6.6 s, RGB→YUV 6.3 s; GPU read-back latency
 ~0.2 s.
 
@@ -178,18 +198,21 @@ the export livelocked at frame 116 (WebCodecs restarting at a CRA, ~185 decodes/
 delivered); the open-GOP start fixed that.
 
 Still to do for Phase 2:
-- Time P3s on the CPU compositor (one run, ~16 min; the bench Chrome exited during it on
-  2026-10-17 at 22:01 and has not been relaunched: the user restarts it).
-- UI p95 on the GPU path (102–357 ms vs 42 ms on the CPU compositor): steps render a batch of
+- P3s on the CPU compositor: timed (label `i420`, one run): 1003.4 s, valid, PSNR 54.42 dB; the
+  GPU path is 99× faster. Needs `--timeout-min 30` (the default 10 min cuts it at frame 110).
+  Agents may launch the bench Chrome themselves when CDP on 9222 is down.
+- UI p95 on the GPU path (P2s 25 ms, P3s 91 ms; P1s meets 20 ms): steps render a batch of
   several frames; size batches by measured step time.
-- Device rule from the revised plan: `AsyncExportRenderer` already takes any device; make
-  `gpu_export::install` take a plain `wgpu::Device`/`Queue` instead of eframe's types.
+- I420 for exports that resize, place or overlay (the Pipeline then keeps RGBA), and NV12 /
+  P010 for HDR (the plan's other conversions).
+- Device rule from the revised plan: done. `gpu_export::install` takes plain `wgpu` handles
+  (`filmcraft_gpu::wgpu`, re-exported so a worker needs no UI crate).
 - GPU coverage: Lumetri input LUT, curves, wheels, HSL secondary and Sharpen still send a layer to
   the CPU; transitions other than dissolve / push (`FramePlan::Composite`) too.
 - Step length: a frame whose plan has a CPU layer still costs seconds inside a step, times the
   prefetch batch; cap prefetch planning per step by measured cost (or leave it to 4a).
-- Zero-copy (`new VideoFrame(webgpuCanvas)`) and the GPU RGB→YUV pass: not started; the plan says
-  measure, don't assume.
+- Zero-copy (`new VideoFrame(webgpuCanvas)`): not started; the plan says measure, don't assume
+  (with I420 read back, the read-back is 1.5 B/px and no longer the obvious cost).
 
 ### Working rules that held up
 - Agents work in git worktrees and commit small steps on their branch; the coordinator merges to
@@ -208,9 +231,8 @@ Still to do for Phase 2:
 The plan was revised on 2026-10-17 (PR #1, `7b9939be` + `b200e580`; loop ladder `66af744f`): after
 Phase 2 the order is **3a → 4a → 4b → 3b → 5**; 3a and 4a do not depend on Phase 2.
 
-1. **Restart the bench Chrome** (user) and time P3s on the CPU compositor.
-2. **Phase 2 leftovers**, cheapest first: batch size by step time (UI p95); `gpu_export::install`
-   on a plain `wgpu::Device` (device rule); GPU RGB→YUV pass (6.3 s of P3s's 24.5 s); remaining
+1. Chrome is 155.0.8059.84 now: consider re-timing `phase2b` (`61362d26`) on it for a clean A/B.
+2. **Phase 2 leftovers**, cheapest first: batch size by step time (UI p95); remaining
    GPU coverage (Lumetri input LUT / curves / wheels / HSL / Sharpen, adjustment layers, complex
    transitions, HDR); `importExternalTexture` for decoded frames; zero-copy `new
    VideoFrame(webgpuCanvas)` (measure first); `timestamp-query` timings.

@@ -93,6 +93,28 @@ frames; the 20 ms target belongs to phases 4a / 4b. The CPU-compositor rows matc
 the lean caches cost nothing there once the decoder's run-ahead is pinned (before `61362d26`
 P1s on the CPU took 22.5 s: 3061 frames decoded for 180).
 
+## 2026-10-17: GPU RGB→YUV (label `i420`, `32baa127`)
+
+The async export renderer converts the composite to BT.709 I420 on the GPU (`crates/gpu/src/i420.wgsl`,
+byte-identical to the CPU conversion in the unit test) and the WebCodecs encoder takes it as it is:
+1.5 bytes a pixel read back instead of 8, no CPU half → f32 / sRGB / YUV passes. **Chrome is
+155.0.8059.84** (auto-updated from 155.0.8059.40, which the earlier tables used): the numbers are
+not strictly comparable, though the change is far beyond what a patch release moves. Same
+machine, `mt`, hardware encoder, OPFS; every output validated, every frame on the GPU.
+
+| config | runs | wall s | fps | realtime | UI p95 ms | LoAF blocking s | wasm peak MiB | render / encode / convert s | Y-PSNR dB (min) |
+|---|---|---|---|---|---|---|---|---|---|
+| P1s-h264-hardware-gpu-opfs-mt | 3+1w | 2.54 ± 0.00 | 70.84 | 2.360 | 16 | 0 | 160 | 0.1 / 0.1 / 0.0 | 48.05 (43.78) |
+| P2s-h264-hardware-gpu-opfs-mt | 6+1w (noisy) | 4.80 ± 0.10 | 75.08 | 2.500 | 25 | 0 | 387 | 0.6 / 0.1 / 0.0 | 46.41 (43.18) |
+| P3s-h264-hardware-gpu-opfs-mt | 3+1w | 10.09 ± 0.04 | 17.85 | 0.590 | 91 | 1 | 655 | 0.9 / 0.4 / 0.0 | 51.31 (48.65) |
+| P3s-h264-hardware-cpu-opfs-mt | 1 | 1003.4 | 0.18 | 0.010 | 4050 | 985 | 1440 | 994.2 / 6.5 / 6.2 | 54.42 (51.20) |
+
+vs `phase2b`: P1s 5.76 → 2.54 s (2.27×), P2s 12.83 → 4.80 s (2.68×), P3s 24.51 → 10.09 s (2.43×);
+UI p95 116 / 102 / 357 → 16 / 25 / 91 ms (P1s meets the 20 ms target); wasm peak −18–33 %; PSNR
+unchanged. vs baseline: P1s 9.3×, P2s 35×, P3s 111×. The stage times are now mostly the main
+thread's share (submissions); the rest of the wall time is GPU work and read-back latency.
+The P3s CPU-compositor row (the one `phase2b` could not finish) is one run: the GPU path is 99× faster than the CPU compositor on P3s. P2s's first runs varied (CV 22 %, 4.6–6.7 s); the reruns settled at 4.7–4.9 s.
+
 ## Iteration log
 
 | # | Label | Hypothesis | Result | Decision |
@@ -100,3 +122,4 @@ P1s on the CPU took 22.5 s: 3061 frames decoded for 180).
 | 0 | `baseline` | – (harness + reference numbers) | table above | reference for every later claim |
 | 1 | `phase1` | WebCodecs hardware encode removes the ~100 ms/frame encode: P1s ≥ 3×, P2s ~1.3× (render-bound); streaming cuts wasm memory | P1s 3.3×, P2s 1.26×, wasm −14 % / −30 %, PSNR +0.6–0.7 dB, all valid | kept (`bd13e6c8`) |
 | 2 | `phase2b` | GPU compositing removes the CPU render (P2s 96 % of the time): P2s ≥ 4×, P3s ≥ 2.5× vs phase 1 | P1s 4.1×, P2s 13.1×, P3s 45.6× vs baseline; GPU 10.5× the CPU compositor on P2s; wasm −58–66 %; all valid; UI p95 102–357 ms; P3s CPU row missing (browser exited) | kept (`2ffd57eb`..`61362d26`) |
+| 3 | `i420` | The GPU converts to I420 (1.5 B/px read back instead of 8, no CPU convert): P3s loses its 6.3 s convert and most of the read-back | P1s 2.27×, P2s 2.68×, P3s 2.43× vs `phase2b`; UI p95 16 / 25 / 91 ms; all valid, PSNR unchanged; Chrome 155.0.8059.84 (was .40) | kept (`32baa127`) |
