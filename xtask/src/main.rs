@@ -560,7 +560,7 @@ const SAFETY_TESTS: &[&str] =
 const GLOBAL_FILES: &[&str] = &["Cargo.toml", "Cargo.lock", "clippy.toml", "rustfmt.toml", "rust-toolchain.toml", ".cargo/"];
 
 /// The fast test tier of `cargo xtask ci` (`--full` runs everything): every test of the packages
-/// the working tree changes (vs HEAD, untracked files included), plus the never-crash suite of all
+/// changed against the upstream branch (unpushed commits, uncommitted and untracked files), plus the never-crash suite of all
 /// the others — their unit tests matching `SAFETY_TESTS` and their integration-test files named
 /// after it (`robustness.rs`, `fuzz.rs`…). Other integration-test binaries of unchanged crates are
 /// not even built, which is most of the time a full run takes.
@@ -573,7 +573,14 @@ fn test_fast() -> Result<(), String> {
         let o = Command::new("git").args(args).current_dir(&root).output().map_err(|e| format!("git: {e}"))?;
         Ok(String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
     };
+    // what this checkout changes against what is published: uncommitted edits, untracked files and
+    // commits not yet on the upstream branch (a merged or rebased branch is all commits); with no
+    // upstream, only the working tree
     let mut changed = git(&["diff", "--name-only", "HEAD"])?;
+    let base = git(&["merge-base", "HEAD", "@{upstream}"])?;
+    if let Some(base) = base.first().filter(|b| !b.is_empty()) {
+        changed.extend(git(&["diff", "--name-only", base.as_str(), "HEAD"])?);
+    }
     changed.extend(git(&["ls-files", "--others", "--exclude-standard"])?);
     if changed.iter().any(|f| GLOBAL_FILES.iter().any(|g| f == g || (g.ends_with('/') && f.starts_with(g)))) {
         println!("ci: workspace-wide files changed: running the full test suite");
