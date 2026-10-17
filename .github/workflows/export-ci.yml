@@ -46,9 +46,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # ffmpeg / ffprobe run only as test oracles (never linked or shipped)
-  FILMCRAFT_FFMPEG: /usr/bin/ffmpeg
-  FILMCRAFT_FFPROBE: /usr/bin/ffprobe
+  # ffmpeg / ffprobe run only as test oracles and fixture generators (never linked or shipped).
+  # Ubuntu's 6.1 lacks what the oracles check (APV, gbrpf16le, current TIFF YCbCr): use a static
+  # 8.x build, the major version the tests are run against locally.
+  FFMPEG_BUILD: ffmpeg-n8.1-latest-linux64-gpl-8.1
+  FILMCRAFT_FFMPEG: /opt/ffmpeg/bin/ffmpeg
+  FILMCRAFT_FFPROBE: /opt/ffmpeg/bin/ffprobe
   # wgpu on Mesa's lavapipe: the GPU parity tests run instead of skipping for want of an adapter
   WGPU_BACKEND: vulkan
 
@@ -62,8 +65,11 @@ jobs:
       - name: Tools (ffmpeg oracle, software Vulkan)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg mesa-vulkan-drivers libvulkan1 pkg-config
-          ffmpeg -version | head -1
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 pkg-config xz-utils
+          curl -fsSL "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$FFMPEG_BUILD.tar.xz" | sudo tar -xJ -C /opt
+          sudo mv "/opt/$FFMPEG_BUILD" /opt/ffmpeg
+          echo /opt/ffmpeg/bin >> "$GITHUB_PATH"
+          /opt/ffmpeg/bin/ffmpeg -version | head -1
       - name: Toolchain
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
@@ -127,7 +133,10 @@ jobs:
         # winit/wgpu (X11, Wayland, Vulkan), the file dialogs (GTK 3), fonts, audio (ALSA)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg mesa-vulkan-drivers libvulkan1 pkg-config \
+          curl -fsSL "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$FFMPEG_BUILD.tar.xz" | sudo tar -xJ -C /opt
+          sudo mv "/opt/$FFMPEG_BUILD" /opt/ffmpeg
+          echo /opt/ffmpeg/bin >> "$GITHUB_PATH"
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 pkg-config xz-utils \
             libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxcb1-dev \
             libgtk-3-dev libfontconfig1-dev libfreetype-dev libasound2-dev
       - name: Toolchain
