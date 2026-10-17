@@ -289,10 +289,16 @@ the `wgpu::Device`/`Queue` it is given and must not reach for eframe's device or
 UI-owned resource. A `GPUDevice` cannot be transferred to a worker, so Phase 4b will create
 a second device in the export worker; nothing in this phase may make that a rewrite. Add a
 unit/integration test that builds the renderer on a freshly created device with no eframe
-context. **Measure, don't assume, zero-copy:** record per-frame time from canvas present to
+context. (State on 2026-10-17: `filmcraft_gpu::AsyncExportRenderer::new(device, queue, budget)`
+already takes any device and `async_readback_matches_sync` builds it on a fresh one; what is
+still tied to eframe is the web glue, `apps/filmcraft-web/src/gpu_export.rs`, which stores
+`eframe::wgpu` handles and is installed from `start()`. Make its `install` take a plain
+`wgpu::Device`/`Queue` so a worker can call it.) **Measure, don't assume, zero-copy:** record per-frame time from canvas present to
 `VideoEncoder.encode()` return, and compare against the `mapAsync` readback path; Chrome
 does not document `new VideoFrame(webgpuCanvas)` as copy-free. *Target: P3 4K wall time
-≥ 2.5× faster than Phase 1 with the CPU compositor; PSNR gates hold.*
+≥ 2.5× faster than Phase 1 with the CPU compositor; PSNR gates hold.* (Phase 1 never measured
+P3 on the CPU compositor: it ran out of the 2 GiB wasm heap. Measure that configuration now
+that it fits, or compare with the baseline; P3s baseline 1118 s.)
 
 **Order after Phase 2.** Phases 3–5 run in this order, each its own PR:
 **3a** (in-memory copies out, chunked fMP4) → **4a** (cooperative pump) → **4b** (export
@@ -300,12 +306,18 @@ worker, which brings the OPFS sync sink) → **3b** (save picker) → **5** (onl
 entry gate passes). 3a and 4a don't depend on Phase 2 and may start in parallel with it in
 a separate worktree.
 
-**Phase 3a: Chunked output, no whole-file buffer.** Replace `Out::Mem` for web exports
-with a chunked sink: the muxer's synchronous `Write` appends into a bounded queue of
-chunks (default 8 MiB each), and the pump hands finished chunks to JS between steps. When
-the queue is full, the pump stops producing frames until JS has drained it (backpressure);
-never block on a promise. Remove the `write_output` → `fs.rs::write_file` `Arc::from`
-copies for exports. Container choice, by sink:
+**Phase 3a: Chunked output, no whole-file buffer.** Already in place (`bd13e6c8`): web
+exports default to `Out::Stream` (`filmcraft_export::StreamTarget`, positioned 4 MiB chunks)
+into an OPFS `createWritable` or JS-side chunks (`apps/filmcraft-web/src/export_sink.rs`,
+`web/export-sink.js`); `sink: "memory"` keeps the old `Out::Mem` path. Missing, and the core
+of this phase: **backpressure.** `export-sink.js` accepts every write synchronously and
+appends it to an unbounded promise chain, so when OPFS writes fall behind the bytes pile up
+in JS memory. Put a bounded queue of chunks (default 8 MiB each) between the muxer's
+synchronous `Write` and the sink, drained by the pump between steps; when it is full, the
+exporter answers `Step::Pending` until JS has drained it. Never block on a promise. Then
+remove `sink: "memory"`, and route the formats that still finish through `write_output` →
+`fs.rs::write_file` (`Arc::from` copies: image-sequence frames, the other unstreamed
+formats) through the stream sink where they are single files. Container choice, by sink:
 - **Unseekable sink** (Blob of chunks, stream): `FragmentedWriter`, ~1–2 s fragments.
 - **Seekable sink** (OPFS, save picker): progressive MP4. For faststart, **reserve** the
   `moov` box at the start of the file. Export knows the exact frame and sample counts up
@@ -325,14 +337,18 @@ Blob sink, wasm heap growth ≤ 512 MB.*
 pump with an adaptive one: step until `scheduler.yield()` is due (target ≤ 8 ms of export
 work per animation frame while the user is interacting, larger batches when the tab is
 idle or hidden), with a `setTimeout(0)` fallback where `scheduler` is missing. Make every
-export format stepped: GIF, image sequences and audio-only must stop calling a synchronous
-`run()` on wasm. This is a small change and is measured on its own, so the worker's gain
+export format stepped: today `filmcraft_export::stepped` covers H.264, HEVC, AV1, ProRes,
+DNxHR, APV, MJPEG and MXF; GIF, the image sequences (PNG, TIFF, BMP, JPEG, TGA, DPX, EXR)
+and audio-only (WAV, AIFF, AAC, FLAC) must stop calling a synchronous `run()` on wasm. This is a small change and is measured on its own, so the worker's gain
 is visible separately. *Target: no export-caused long animation frame over 100 ms; UI p95
 improvement recorded vs Phase 3a.*
 
 **Phase 4b: Export worker.** Run export in a dedicated worker with its own wasm instance,
 its own `wgpu` device (created from the Phase 2 device-agnostic renderer), and its own
-WebCodecs decoders. Pass a serialized project snapshot (the UI state is already serde) and
+WebCodecs decoders. Those decoders must keep the UI path's rules: start an open-GOP leading
+picture (HEVC RASL after a CRA) one GOP earlier, and keep recently asked frames cached
+(`webcodecs.rs`, `filmcraft_media::cache::evict_far`); without them the 4K P3s export
+re-decoded one frame forever. Pass a serialized project snapshot (the UI state is already serde) and
 `File` handles. Progress, cancel and errors go over `postMessage`. Inside the worker, add
 the OPFS `createSyncAccessHandle()` sink (it only works in dedicated workers), and
 download the result as the OPFS `File` with no copy. Things to budget and measure:
