@@ -26,6 +26,8 @@ pub fn decode_json() -> Value {
         // decoded frames all sources hold, and the budget idle sources are trimmed to
         "cacheMB": filmcraft_codecs::cached_bytes() as f64 / 1e6,
         "cacheBudgetMB": filmcraft_codecs::FRAME_BUDGET as f64 / 1e6,
+        // caches are lean (an export runs on the web): budgets well below the above
+        "leanCaches": filmcraft_media::lean::active(),
         // plane buffers of evicted frames waiting for the next decoded pictures, and how many
         // planes were decoded into a recycled buffer
         "planePoolMB": filmcraft_frame::pool::stats().idle_bytes as f64 / 1e6,

@@ -328,6 +328,9 @@ impl PlanCache {
     }
 }
 
+/// Frame cache budget while caches are lean ([`filmcraft_media::lean`]).
+const LEAN_BUDGET: usize = 128 << 20;
+
 struct Cache {
     map: HashMap<FrameKey, (Arc<Rgba>, u64)>,
     bytes: usize,
@@ -342,11 +345,13 @@ impl Cache {
         if let Some((old, _)) = self.map.insert(k, (v, self.clock)) {
             self.bytes -= old.px.len();
         }
-        if self.bytes > self.budget {
+        // an export on the web reads its own frames: the monitors keep a few while it runs
+        let budget = filmcraft_media::lean::cap(self.budget, LEAN_BUDGET);
+        if self.bytes > budget {
             let mut all: Vec<(u64, FrameKey, usize)> = self.map.iter().map(|(k, (v, s))| (*s, *k, v.px.len())).collect();
             all.sort_unstable_by_key(|x| x.0);
             for (_, k, b) in all {
-                if self.bytes <= self.budget * 8 / 10 {
+                if self.bytes <= budget * 8 / 10 {
                     break;
                 }
                 self.map.remove(&k);

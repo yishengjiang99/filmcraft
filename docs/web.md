@@ -67,7 +67,9 @@ tracking) report an error on the web for now.
 single-threaded build otherwise, on `?nothreads`, or if the threaded start throws. In the
 threaded build the FrameServer runs its real worker pool (a failed spawn degrades back to
 the UI-thread pump, so frames keep flowing); the rest of the app — mixing, export, media
-reads — still runs cooperatively as above. See
+reads — still runs cooperatively as above. Its shared memory may grow to 4 GiB (the wasm32
+maximum; it was 2 GiB, which a 4K export outgrew): a browser that cannot reserve that much fails
+the threaded start, and `index.html` falls back to the single-threaded build. See
 [web-optimization-plan.md](web-optimization-plan.md) for the roadmap.
 
 ### Media reads
@@ -133,12 +135,20 @@ prefetches the next batch before collecting the current one, so the GPU draws ba
 CPU converts and encodes batch *k*. Frames the GPU path declines render on the CPU: transitions
 other than dissolves (`FramePlan::Composite`), adjustment layers, HDR / wide-gamut sequences, and
 every frame after a GPU validation / out-of-memory error, a failed `mapAsync` (lost device) or a
-read-back slower than 10 s. `file.exportMedia` `gpuRendering: "off"` keeps an export on the CPU
+read-back that has not finished after 30 s and 30 looks at it. `file.exportMedia` `gpuRendering: "off"` keeps an export on the CPU
 (the default on the web is `auto`; natively `off`); `?cpu` / `?webgl` have no WebGPU export at all.
 `filmcraft.info().export.compositor` says what drew the last export (`gpu`, `cpu`, or `gpu+cpu`
 when some frames fell back), with `gpuFrames` / `cpuFrames`, `gpuEffects` (effect stage on the
 GPU) and `gpuError` (why the GPU path stopped). `export.gpu` (timestamp-query pass timings) is
 `null`: eframe's device is created without the `timestamp-query` feature.
+
+**Memory.** The decode and frame caches are sized for playback (a 1 GiB shared decode budget
+with at least 64 frames per source, 40 frames per WebCodecs source, 768 MB of monitor frames);
+a one-pass export reads each frame once, in order, so while a stepped export job exists the
+caches are lean (`filmcraft_media::lean`): 256 MiB of decoded frames shared (128 MiB or 12 frames
+per source), 16 frames per WebCodecs source, 128 MiB of monitor frames. The job holds the guard,
+so the caches go back to their playback sizes however the export ends. `perf.stats`
+`decode.leanCaches` says whether they are lean now.
 
 **Encoding.** H.264 and HEVC are encoded by the browser's WebCodecs `VideoEncoder`
 (hardware where the browser has one: `webcodecs_encode.rs`) and otherwise by the built-in H.264

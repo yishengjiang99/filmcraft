@@ -456,6 +456,8 @@ pub struct SteppedJob {
     pub provider: media_pool::PoolProvider,
     pub progress: Arc<filmcraft_export::Progress>,
     pub result: Arc<std::sync::Mutex<Option<std::result::Result<filmcraft_export::Report, String>>>>,
+    /// Decode and frame caches stay lean while the job exists (dropped however it ends).
+    pub lean: filmcraft_media::lean::LeanGuard,
 }
 
 /// A background job with shared progress.

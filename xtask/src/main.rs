@@ -377,7 +377,7 @@ fn web(args: &[String]) -> Result<(), String> {
         // The module must import a *shared* memory (created by the JS glue), or std's
         // thread support dies at the first spawn with "Int32Array is not a shared
         // typed array". --shared-memory requires explicit initial/max sizes.
-        flags.push_str("\u{1f}-C\u{1f}link-arg=--import-memory\u{1f}-C\u{1f}link-arg=--export-memory\u{1f}-C\u{1f}link-arg=--shared-memory\u{1f}-C\u{1f}link-arg=--initial-memory=67108864\u{1f}-C\u{1f}link-arg=--max-memory=2147483648");
+        flags.push_str("\u{1f}-C\u{1f}link-arg=--import-memory\u{1f}-C\u{1f}link-arg=--export-memory\u{1f}-C\u{1f}link-arg=--shared-memory\u{1f}-C\u{1f}link-arg=--initial-memory=67108864\u{1f}-C\u{1f}link-arg=--max-memory=4294967296");
         // wasm-bindgen's thread transform needs the TLS symbols exported.
         flags.push_str("\u{1f}-C\u{1f}link-arg=--export=__wasm_init_tls\u{1f}-C\u{1f}link-arg=--export=__tls_size\u{1f}-C\u{1f}link-arg=--export=__tls_align\u{1f}-C\u{1f}link-arg=--export=__tls_base");
         b.env("CARGO_ENCODED_RUSTFLAGS", flags);

@@ -259,6 +259,28 @@ const HARD_DECODERS: usize = 8;
 /// nobody was looking at.
 pub const FRAME_BUDGET: usize = 1 << 30;
 
+/// [`FRAME_BUDGET`] while caches are lean ([`filmcraft_media::lean`]: an export on the web).
+const LEAN_FRAME_BUDGET: usize = 256 << 20;
+
+/// A cache's own budget while caches are lean.
+const LEAN_CACHE_BUDGET: usize = 128 << 20;
+
+/// [`MIN_FRAMES`] while caches are lean: enough for a frame-threaded decoder's run-ahead.
+const LEAN_MIN_FRAMES: usize = 12;
+
+/// The bytes one cache may keep, given its own budget and the size of its frames.
+///
+/// A one-pass export (lean caches: the web) reads each frame once, in order: the frames the
+/// decoder ran ahead with are enough, not a playback GOP.
+fn cache_budget(budget: usize, frame_bytes: usize, lean: bool) -> usize {
+    if lean { budget.min(LEAN_CACHE_BUDGET).max(LEAN_MIN_FRAMES.saturating_mul(frame_bytes)) } else { budget.max(MIN_FRAMES.saturating_mul(frame_bytes)) }
+}
+
+/// The bytes all caches of a pool may keep together.
+fn shared_budget(budget: usize, lean: bool) -> usize {
+    if lean { budget.min(LEAN_FRAME_BUDGET) } else { budget }
+}
+
 /// What the caches of a process share: the cap on live decoders and the frame budget.
 struct Pool {
     caches: Mutex<Vec<Weak<Shared>>>,
@@ -395,7 +417,8 @@ impl Pool {
     /// budget. Caches in use keep theirs (each within its own budget): a frame evicted before it is shown costs a
     /// re-decode from the keyframe.
     fn trim_frames(&self, me: &Shared) {
-        let over = || self.bytes.load(Ordering::Relaxed) > self.budget;
+        let budget = shared_budget(self.budget, filmcraft_media::lean::active());
+        let over = || self.bytes.load(Ordering::Relaxed) > budget;
         if !over() {
             return;
         }
@@ -563,7 +586,7 @@ impl GopCache {
         } else {
             st.drafts.remove(&pts);
         }
-        let budget = self.budget.max(MIN_FRAMES * f.byte_size());
+        let budget = cache_budget(self.budget, f.byte_size(), filmcraft_media::lean::active());
         let before = st.bytes;
         st.bytes += f.byte_size();
         if let Some(old) = st.frames.insert(pts, Arc::new(f)) {
@@ -1172,6 +1195,20 @@ mod tests {
         let s2 = samples(300, 250, 3, false);
         let c2 = GopCache::new(None);
         assert!((0..12).all(|i| !is_draft(&c2.frame(&s2, i * 1000).expect("frame"))));
+    }
+
+    #[test]
+    fn lean_budgets_keep_a_decoders_run_ahead_not_a_gop() {
+        // (pure: a guard taken here would change the budgets of tests running beside it)
+        let k4 = 3840 * 2160 * 3 / 2;
+        assert_eq!(cache_budget(384 << 20, k4, false), MIN_FRAMES * k4);
+        assert_eq!(cache_budget(384 << 20, k4, true), LEAN_MIN_FRAMES * k4);
+        assert_eq!(cache_budget(384 << 20, 1920 * 1080 * 3 / 2, true), LEAN_CACHE_BUDGET);
+        assert_eq!(cache_budget(0, 4, true), LEAN_MIN_FRAMES * 4);
+        assert_eq!(cache_budget(usize::MAX, usize::MAX, true), usize::MAX);
+        assert_eq!(shared_budget(FRAME_BUDGET, false), FRAME_BUDGET);
+        assert_eq!(shared_budget(FRAME_BUDGET, true), LEAN_FRAME_BUDGET);
+        assert_eq!(shared_budget(40, true), 40);
     }
 
     #[test]

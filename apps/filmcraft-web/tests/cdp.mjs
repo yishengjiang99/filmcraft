@@ -115,6 +115,7 @@ async function connect(wsUrl) {
       const page = makePage(send, on, sessionId, targetId);
       await page.send("Page.enable");
       await page.send("Runtime.enable");
+      await send("Inspector.enable", {}, sessionId).catch(() => {});
       if (width && height) await page.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false }).catch(() => {});
       if (url !== "about:blank") await page.navigate(url);
       return page;
@@ -129,7 +130,26 @@ async function connect(wsUrl) {
 
 function makePage(send, on, sessionId, targetId) {
   const logs = [];
+  // set when the renderer crashed or the wasm instance trapped: the page then never answers
+  // promises again (`js` rejects instead of waiting forever)
+  let broken = null;
+  const breakers = new Set();
+  const markBroken = (why) => {
+    if (broken) return;
+    broken = why;
+    for (const f of breakers) f(new Error(`page broken: ${why}`));
+  };
+  const TRAP = /RuntimeError|unreachable executed|memory access out of bounds|Out of memory/i;
   on(sessionId, (method, params) => {
+    if (method === "Inspector.targetCrashed") markBroken("the renderer crashed");
+    if (method === "Runtime.exceptionThrown") {
+      const d = params.exceptionDetails.exception?.description ?? params.exceptionDetails.text ?? "";
+      if (TRAP.test(d)) markBroken(d.split("\n")[0]);
+    }
+    if (method === "Runtime.consoleAPICalled" && params.type === "error") {
+      const t = params.args.map((a) => a.value ?? a.description ?? "").join(" ");
+      if (TRAP.test(t)) markBroken(t.split("\n")[0]);
+    }
     if (method === "Runtime.consoleAPICalled") {
       logs.push(`${params.type}: ` + params.args.map((a) => a.value ?? a.description ?? "").join(" "));
     } else if (method === "Runtime.exceptionThrown") {
@@ -142,11 +162,29 @@ function makePage(send, on, sessionId, targetId) {
     sessionId,
     targetId,
     logs,
+    /// Why the page stopped answering (renderer crash, wasm trap), or null.
+    get broken() { return broken; },
     send: (method, params) => send(method, params, sessionId),
     on: (f) => on(sessionId, f),
     /// Evaluate `expr` (promises awaited) and return its JSON value; throws on a JS exception.
+    /// `timeout` also bounds an awaited promise (CDP's own timeout covers synchronous code only),
+    /// and a page that crashed or trapped fails at once.
     async js(expr, timeout = 120000) {
-      const r = await send("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true, timeout }, sessionId);
+      if (broken) throw new Error(`page broken: ${broken}`);
+      let timer = null;
+      let breaker = null;
+      const guard = new Promise((_, rej) => {
+        timer = setTimeout(() => rej(new Error(`${expr.slice(0, 200)}: no answer in ${timeout} ms`)), timeout + 5000);
+        breaker = rej;
+        breakers.add(rej);
+      });
+      let r;
+      try {
+        r = await Promise.race([send("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true, timeout }, sessionId), guard]);
+      } finally {
+        clearTimeout(timer);
+        breakers.delete(breaker);
+      }
       if (r.exceptionDetails) throw new Error(`${expr.slice(0, 200)}: ${r.exceptionDetails.exception?.description ?? r.exceptionDetails.text}`);
       return r.result.value;
     },

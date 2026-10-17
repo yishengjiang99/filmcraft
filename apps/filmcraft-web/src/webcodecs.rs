@@ -51,6 +51,9 @@ struct Transfers {
 const LOOKAHEAD: usize = 8;
 /// Decoded frames kept per source.
 const CACHE_FRAMES: usize = 40;
+/// ... while an export runs ([`filmcraft_media::lean`]): it reads each frame once, in order, so
+/// the pictures the decoder runs ahead with are enough (40 4K frames are 500 MB of the heap).
+const LEAN_CACHE_FRAMES: usize = LOOKAHEAD + 8;
 /// Chunks allowed in the decoder's queue before feeding pauses.
 const MAX_QUEUE: u32 = 24;
 /// A session that delivered nothing for this long may be restarted by another request.
@@ -550,7 +553,8 @@ impl WcSource {
             let f = if self.config.rotation != 0 { f.rotated(self.config.rotation) } else { f };
             c.frames.insert(pts, Arc::new(f));
         }
-        while c.frames.len() > CACHE_FRAMES {
+        let keep = filmcraft_media::lean::cap(CACHE_FRAMES, LEAN_CACHE_FRAMES);
+        while c.frames.len() > keep {
             let Some(far) = c.frames.keys().copied().max_by_key(|p| (p - want).abs()) else { break };
             c.frames.remove(&far);
         }

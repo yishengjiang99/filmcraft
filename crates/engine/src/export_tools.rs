@@ -509,7 +509,7 @@ pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut set
         let batch = exporter.async_batch().unwrap_or(1);
         exporter.set_batch(batch);
         s.jobs.push(job);
-        s.stepped.push(crate::SteppedJob { job: id, exporter, provider, progress: prog, result: res });
+        s.stepped.push(crate::SteppedJob { job: id, exporter, provider, progress: prog, result: res, lean: filmcraft_media::lean::enter() });
         return Ok(id);
     }
     let run = move || {

@@ -126,6 +126,8 @@ async function oneRun(browser, project, runDir, i) {
   const page = await browser.newPage("about:blank");
   livePage = page;
   const r = { run: i };
+  // the export's poll samples, kept for a failed run (where it stopped, how big the heap was)
+  let polled = null;
   try {
     await page.send("Page.addScriptToEvaluateOnNewDocument", { source: PAGE_PROBE });
     await page.send("Log.enable").catch(() => {});
@@ -183,6 +185,7 @@ async function oneRun(browser, project, runDir, i) {
     const t0 = Date.now();
     const ex = await page.js(`filmcraft.execute("file.exportMedia", ${JSON.stringify(params)})`);
     const samples = [];
+    polled = samples;
     let firstFrameMs = null;
     let job = null;
     let scrubbing = false;
@@ -203,12 +206,17 @@ async function oneRun(browser, project, runDir, i) {
     let lastMetrics = 0;
     try {
       while (Date.now() - t0 < PROJECT_TIMEOUT_MS) {
-        const [jobs, info] = await page.js(`Promise.all([filmcraft.execute("jobs.list"), Promise.resolve(filmcraft.info())])`);
+        // (a CPU-rendered 4K step can hold the main thread for tens of seconds)
+        if (page.broken) throw new Error(`export stopped: ${page.broken}`);
+        const [jobs, info] = await page.js(`Promise.all([filmcraft.execute("jobs.list"), Promise.resolve(filmcraft.info())])`, 180000);
         job = jobs.find((j) => j.id === ex.job);
-        const s = { t: Date.now() - t0, done: job?.done ?? null, wasm: info.memory?.wasmBytes ?? null };
+        const s = { t: Date.now() - t0, done: job?.done ?? null, wasm: info.memory?.wasmBytes ?? null, decoded: info.webcodecsStats?.framesDecoded ?? null };
         if (Date.now() - lastMetrics > 1000) {
           const m = await page.send("Performance.getMetrics").catch(() => null);
           s.jsHeap = m?.metrics.find((x) => x.name === "JSHeapUsedSize")?.value ?? null;
+          // cache sizes while the export runs (the numbers after it are back to playback sizes)
+          const ps = await page.js(`filmcraft.request("perf.stats", {}).then((p) => ({ decodeMB: p.decode?.cacheMB, imageMB: p.frames?.cache?.imageMB, lean: p.decode?.leanCaches }))`, 10000).catch(() => null);
+          if (ps) Object.assign(s, ps);
           lastMetrics = Date.now();
         }
         samples.push(s);
@@ -265,6 +273,11 @@ async function oneRun(browser, project, runDir, i) {
       longtasks: { count: pb.longtasks.length, max: pb.longtasks.length ? Math.max(...pb.longtasks) : 0, tbtMs: pb.longtasks.reduce((s, d) => s + Math.max(0, d - 50), 0) },
       perfStatsUi: perf?.ui ?? null,
       // where the memory goes: decoded-frame cache, plane pool, frame-server caches, WebCodecs sources
+      cachePeak: {
+        decodeMB: Math.max(0, ...samples.map((s) => s.decodeMB).filter(Number.isFinite)),
+        imageMB: Math.max(0, ...samples.map((s) => s.imageMB).filter(Number.isFinite)),
+        lean: samples.some((s) => s.lean === true),
+      },
       memoryDetail: perf ? { decode: { cacheMB: perf.decode?.cacheMB, cacheBudgetMB: perf.decode?.cacheBudgetMB, planePoolMB: perf.decode?.planePoolMB, liveDecoders: perf.decode?.liveDecoders }, frames: perf.frames?.cache ?? null, webcodecs: infoAfter.webcodecsStats?.transfers ?? null } : null,
       memory: {
         wasmStart: wasm[0] ?? null, wasmPeak: wasm.length ? Math.max(...wasm) : null, wasmGrowth: wasm.length ? Math.max(...wasm) - wasm[0] : null,
@@ -296,6 +309,7 @@ async function oneRun(browser, project, runDir, i) {
     });
   } catch (e) {
     r.error = String(e?.message ?? e);
+    if (polled) r.lastSamples = polled.slice(-12);
   }
   r.fatal = page.fatalLogs();
   r.consoleTail = page.logs.slice(-20);
