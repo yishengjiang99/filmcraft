@@ -1,7 +1,7 @@
 # Handoff: GPU-first, hardware-encoded, streaming web export
 
 Status of the work on [`export-optimize-gpu.md`](export-optimize-gpu.md) (the plan) as of
-2026-10-16. Numbers: [`benchmarks/web-export.md`](benchmarks/web-export.md); every number there
+2026-10-17. Numbers: [`benchmarks/web-export.md`](benchmarks/web-export.md); every number there
 cites a `target/web-bench/results.jsonl` line (label + git sha) on the bench machine.
 
 ## Where it stands
@@ -12,9 +12,9 @@ cites a `target/web-bench/results.jsonl` line (label + git sha) on the bench mac
 | §2 harness (`export-bench`, `validate-export`, `bench-compare`, `bench-matrix`, `make-ref`) | done, committed |
 | §2.4 baseline | short projects (P1s/P2s/P3s) + full P1 measured; full P2/P3/P4 not run (see "Baseline") |
 | Phase 1 WebCodecs hardware encoder | done, committed (`bd13e6c8`); measured on P1s/P2s (below) |
-| Phase 3 streaming output (OPFS / Blob) | done, committed (`bd13e6c8`); OPFS + Blob sinks validated; memory effect not yet separated from Phase 1 (below) |
-| Phase 2 GPU compositing for export | **in progress** on branch `worktree-agent-a88eed9bd193a763f` (worktree `.claude/worktrees/agent-a88eed9bd193a763f`): 1 commit + uncommitted work; P2s works on the GPU, P3s blocked on wasm memory (see "Phase 2 in progress") |
-| Phase 4 off the main thread | not started; design notes below |
+| Phase 3 streaming output (OPFS / Blob) | streaming done (`bd13e6c8`; OPFS + Blob sinks validated); in the revised plan this is part of **3a**, whose missing piece is backpressure (`export-sink.js` queues writes on an unbounded promise chain) and fMP4 for unseekable sinks |
+| Phase 2 GPU compositing for export | **working on `main`** (`2ffd57eb`..`36fdfadf`): P1s/P2s/P3s render every frame on the GPU and validate; timed matrix not run yet; remaining items under "Phase 2 state" |
+| Phase 4 off the main thread | not started; the revised plan splits it into **4a** (cooperative `scheduler.yield` pump) and **4b** (export worker) |
 | Phase 5 simd128 in `h264enc` | done, on `main` (`5a5e4e79`..`64348228`): software encoder 1.9x faster on wasm (node), 1.75x native, bytes unchanged; Chrome export + P1s sha check not yet run |
 
 Also done on the way: `cargo xtask ci` fast test tier (`--full` for everything), OPFS writes in
@@ -82,11 +82,21 @@ node apps/filmcraft-web/tests/fixtures.mjs        # re-run after every build: xt
 node apps/filmcraft-web/tests/make-ref.mjs --projects P1s,P2s,P3s
 export FFMPEG=/opt/homebrew/bin/ffmpeg FFPROBE=/opt/homebrew/bin/ffprobe
 node apps/filmcraft-web/tests/bench-matrix.mjs --label <change> --url http://127.0.0.1:8766/ --matrix short
+# one correctness run (fails within --stall-s 60 when an export stops moving)
+node apps/filmcraft-web/tests/export-bench.mjs --url http://127.0.0.1:8766/ --project P3s --encoder hardware --compositor gpu --sink opfs --build mt --runs 1 --warmup 0 --label <change> --validate --ref target/web-bench/ref/P3s.mov
 node apps/filmcraft-web/tests/bench-compare.mjs --baseline baseline --doc docs/benchmarks/web-export.md
 FILMCRAFT_FFMPEG=/opt/homebrew/bin/ffmpeg FILMCRAFT_FFPROBE=/opt/homebrew/bin/ffprobe cargo xtask ci
 ```
 
-## Known unrelated failure
+## Known unrelated failures
+
+- `filmcraft-ui-egui` `tests/graphics_notice_ui.rs` `the_notice_follows_the_interface_language`
+  (expects Spanish "renderizado por software", gets "procesamiento por software") and
+  `tests/timeline_marquee_ui.rs` `alt_box_selects_only_video_and_delete_keeps_linked_audio`
+  ("release preserves the individual selection") fail on `2ffd57eb` without this work too.
+- `filmcraft-export` `async_encoder_tests::a_blocking_export_explains_an_asynchronous_encoder` is
+  flaky in the full crate run (a process-wide encoder registry shared with other tests); it
+  passes alone.
 
 `cargo test --workspace` fails one ffmpeg oracle test with Homebrew ffmpeg/ffprobe 8.x:
 `filmcraft-matroska` `tests/oracle.rs` `mjpeg_ac3` ("packet 56 (track 1): duration ffprobe 32 vs 8",
@@ -113,44 +123,63 @@ matroska changes or `Cargo.lock` changes (which forces the full suite).
 - `info().threads` is hard-coded `false` even in the `mt` build (cosmetic; `filmcraftLoad.threaded`
   is the truth).
 - Element rects from `ui.elements` are in canvas backing pixels (2× CSS here).
+- **The fast CI tier picks tests from unpushed changes**: after a push, `cargo xtask ci` runs only
+  the never-crash suite ("no package changed"). Run the changed crates' tests (or `--full`)
+  before pushing.
+- **A hang costs a 30–40 min run**: `export-bench` now fails a run whose frame count does not move
+  for `--stall-s` (60) seconds and stores `stall` (export + WebCodecs session state) and
+  `lastSamples` in `runs.json`; page calls are bounded and a trap / renderer crash fails at once.
+- **Open-GOP HEVC** (x265's and iPhone's CRA + RASL leading pictures): a decoder started at the
+  CRA drops the leading pictures. The WebCodecs source must start one GOP earlier (it does now,
+  as `filmcraft_codecs`' `decode_start`); P3s's 4K fixture has such GOPs (sample 116 is a CRA
+  with pts of frame 120; frames 116–119 follow it).
+- **Do not attach a second CDP client to the benchmark tab**: a probe script's connection may
+  have closed the harness's socket once (it exited with "unsettled top-level await"; sends now
+  fail on a closed connection instead).
 - The baseline uses `--legacy` (no `encoder`/`sink` params, which did not exist yet); later runs of
   the software path pass `--encoder software --compositor cpu` and must stay byte-identical.
 
-## Phase 2 in progress (state at handoff, 2026-10-16 ~17:00)
+## Phase 2 state (2026-10-17)
 
-Work is on branch `worktree-agent-a88eed9bd193a763f` (git worktree
-`.claude/worktrees/agent-a88eed9bd193a763f`, based on `19b98cef`; `main` has since moved on with
-Phase 5 and an xtask fix, so rebase before merging). The agent stopped at a usage limit.
+All on `main`, pushed. Commits: `b40586f3` asynchronous frame renderers in the stepped exporter;
+`2ffd57eb` async read-back ring (`crates/gpu/src/async_export.rs`) + web renderer factory
+(`apps/filmcraft-web/src/gpu_export.rs`); `16eec44e` lean caches during web exports
+(`filmcraft_media::lean`: decode pool 256 MiB / 12 frames per source, WebCodecs 16 frames,
+monitors 128 MiB, released when the job is dropped), `mt` heap max 4 GiB, harness trap handling;
+`6fe735d5` Lumetri Look LUT on the GPU effect stage (own pass, storage-buffer 3D table, parity
+3e-7); `34cab1fc` WebCodecs open-GOP start + recently asked frames pinned
+(`filmcraft_media::cache::evict_far`); `36fdfadf` harness stall detection. Also `9fca3178` (wasm
+clippy in `proxies.rs`, unrelated).
 
-- **Committed** `e78fa927` "export: asynchronous frame renderers (Ready / Pending / Declined),
-  partial batches, prefetch" (crates/export).
-- **Uncommitted in the worktree** (check `git -C <worktree> status`): `crates/gpu/src/async_export.rs`
-  (async read-back ring on the existing device), `apps/filmcraft-web/src/gpu_export.rs` (frame-renderer
-  factory on eframe's WebGPU device), edits to crates/gpu (lib.rs, export_renderer.rs, Cargo.toml),
-  crates/export/src/lib.rs, crates/engine/src/export_tools.rs, apps/filmcraft-web (api.rs, lib.rs,
-  Cargo.toml, tests/export-bench.mjs), docs/web.md, Cargo.lock.
-- **Measured (single indicative run, not a benchmark):** P2s on the GPU 10.7 s (phase 1: 133.8 s,
-  baseline 168.2 s), 360/360 frames on the GPU, Y-PSNR 46.38 dB (min 43.18), SSIM 0.985.
-- **Bug found and fixed in the work:** on WebGPU the compositor's effect stage was always disabled
-  (an error-scope future polled once, `Pending` treated as failure), so Lumetri / blur / etc. ran
-  on the CPU even in previews.
-- **Blocker: P3s (4K)** traps (`RuntimeError: unreachable`, allocation failure) in the `mt` build at
-  ~1.95–2.14 GB of wasm heap: `mt` is linked with `--max-memory=2147483648`; the phase-1 CPU path
-  already peaked at 1.93 GB (1 GiB decode `FRAME_BUDGET` + 4K f32 intermediates). Approved
-  fixes (coordinator decision): **(b) first** — cap the decoded-frame cache (and other playback-sized
-  caches, e.g. WebCodecs' 40-frame per-source cache) while a web export runs, restore it when the
-  export ends however it ends, report wasm peaks before/after; **(a)** raise the `mt` link max to
-  4 GiB (`--max-memory=4294967296`) in xtask, confirming the `mt` build still instantiates and a
-  failed threaded start still falls back to `st` (index.html), noted in docs/web.md. The agent was
-  also trimming its own path (upload cache 24 → 8, banded f16 conversion instead of a 66 MB copy,
-  30 s read-back timeout).
-- **Harness bug to fix:** `export-bench.mjs` hangs forever when the page traps mid-export (ignores
-  `--timeout-min`): wrap each `page.js`/`send` in the poll loop with a timeout and fail the run on
-  `Inspector.targetCrashed` or a `RuntimeError`/`unreachable` console line.
-- **Still to do for Phase 2:** the above, then gates (per-crate tests, clippy incl. wasm, fmt, smoke),
-  commit, then the coordinator runs the timed matrix (`--compositor gpu` vs `cpu`, P1s/P2s/P3s) on a
-  quiet machine, merges to `main`, pushes, and logs the iteration in `docs/benchmarks/web-export.md`.
-  `export-bench --compositor gpu|cpu` sends `gpuRendering: auto|off` in that work.
+Single correctness runs (not benchmarks), Chrome 155.0.8059.40, `mt`, hardware encoder, OPFS,
+`--compositor gpu`:
+
+| project | wall s | baseline s | GPU / CPU frames | wasm peak MB (baseline) | UI p95 ms (baseline) | Y-PSNR dB (min) | SSIM |
+|---|---|---|---|---|---|---|---|
+| P2s | 10.7 | 168.2 | 360 / 0 | — (1400) | — | 46.38 (43.18) | 0.985 |
+| P3s | 27.6 | 1118.0 | 180 / 0 | 893 (1933) | 300 (5292) | 51.32 (48.65) | 0.997 |
+
+P3s stage times: render 10.4 s, encode 6.6 s, RGB→YUV 6.3 s; GPU read-back latency ~0.2 s.
+
+How P3s got there (each step a run): with the 2 GiB `mt` heap it trapped; lean caches + 4 GiB
+kept it at 1.6–1.7 GB but at ~19 s/frame, because the Look LUT made the planner render the whole
+4K Blur + Lumetri + Vignette layer on the CPU (the async renderer's prefetch planned 3 such frames
+per step: 20–25 s main-thread stalls); with the LUT on the GPU every frame went to the GPU, then
+the export livelocked at frame 116 (WebCodecs restarting at a CRA, ~185 decodes/s, nothing
+delivered); the open-GOP start fixed that.
+
+Still to do for Phase 2:
+- The timed matrix (`--compositor gpu` vs `cpu`, P1s/P2s/P3s, 3 runs + warmup) on a quiet machine,
+  logged in `docs/benchmarks/web-export.md` (the plan's P3 target compares with Phase 1 on the
+  CPU compositor, never measured because it trapped: measure it now that it fits).
+- Device rule from the revised plan: `AsyncExportRenderer` already takes any device; make
+  `gpu_export::install` take a plain `wgpu::Device`/`Queue` instead of eframe's types.
+- GPU coverage: Lumetri input LUT, curves, wheels, HSL secondary and Sharpen still send a layer to
+  the CPU; transitions other than dissolve / push (`FramePlan::Composite`) too.
+- Step length: a frame whose plan has a CPU layer still costs seconds inside a step, times the
+  prefetch batch; cap prefetch planning per step by measured cost (or leave it to 4a).
+- Zero-copy (`new VideoFrame(webgpuCanvas)`) and the GPU RGB→YUV pass: not started; the plan says
+  measure, don't assume.
 
 ### Working rules that held up
 - Agents work in git worktrees and commit small steps on their branch; the coordinator merges to
@@ -164,29 +193,23 @@ Phase 5 and an xtask fix, so rebase before merging). The agent stopped at a usag
 
 ## Next steps (in order)
 
-1. `bench-compare.mjs` pairs results by exact config name, so baseline (`software-cpu-auto`) and
-   new (`hardware-cpu-opfs`) configs do not line up: add a `--map` / project-level comparison.
-2. Quick loop on P1s/P2s with `--encoder hardware` vs `software`; validate (PSNR gate ≥ 38 dB vs
-   the CLI reference is the colour-matrix check for the WebCodecs path); log the iteration.
-3. Phase 3 measurement: `--sink opfs` vs `memory`, wasm peak; then investigate the decode caches
-   (`memoryDetail`): the 1 GiB `FRAME_BUDGET` and WebCodecs' 40-frame per-source cache are sized
-   for playback, not for a one-pass export; P4 (60 min) cannot finish without streaming (5.4 GB
-   output > 4 GiB wasm).
-4. Phase 2: finish per "Phase 2 in progress" above. Original design note: `ExportRenderer::render` reads back synchronously, which
-   cannot work on the browser's main thread. Needed: an asynchronous render path in the stepped
-   exporter (submit frame N, `mapAsync`, collect on a later step, same `Step::Pending` pattern as
-   the encoder), using eframe's WebGPU device; then the zero-copy variant (render the output
-   picture into a WebGPU `OffscreenCanvas` → `new VideoFrame(canvas)` → hardware encoder), which
-   needs the post-render CPU steps (placement, overlays, limiter) on the GPU. Transitions
-   (`FramePlan::Composite`) still go to the CPU.
-5. Phase 4: in the `mt` build the FrameServer already renders previews on worker threads;
-   offloading export rendering there (main thread polls, never blocks: `Atomics.wait` is not
-   allowed on it) parallelizes the CPU path too. WebCodecs decode sessions are UI-thread-only.
-6. Phase 5 follow-ups: measure the software path in Chrome (`--encoder software`, P1s must keep
-   sha `97aad066…`; encode stage was 17.9 s); next hot spots on wasm are 16x16 SATD in the sub-pel
-   search, CABAC `renorm` (bit-at-a-time; a carry-propagating byte writer would give the same bits),
-   `mc_luma` and the half-sample interpolation. `Preset::Speed` was *not* made the wasm default (it
-   changes the output); offer it as an explicit opt-in if wanted.
+The plan was revised on 2026-10-17 (PR #1, `7b9939be` + `b200e580`): after Phase 2 the order is
+**3a → 4a → 4b → 3b → 5**; 3a and 4a do not depend on Phase 2.
+
+1. Phase 2: the timed matrix and the items under "Phase 2 state".
+2. `bench-compare.mjs` pairs results by exact config name, so baseline (`software-cpu-auto`) and
+   new (`hardware-gpu-opfs`) configs do not line up: add a `--map` / project-level comparison.
+3. 3a: bounded chunk queue with backpressure in front of the existing `StreamTarget`; fMP4 for
+   unseekable sinks, reserved-`moov` progressive MP4 for seekable ones; peak tab memory
+   (`measureUserAgentSpecificMemory`, already recorded as `uaBefore`/`uaAfter`) in the criteria.
+4. 4a: adaptive `scheduler.yield` pump; GIF, image sequences and audio-only stepped.
+5. 4b: export worker with its own wasm instance, `wgpu` device and WebCodecs decoders (keep the
+   open-GOP start and frame pinning); the OPFS sync-handle sink.
+6. 3b: save picker sink.
+7. 5: only if a WebCodecs `prefer-software` vs `h264enc` bench justifies it. Earlier follow-ups:
+   measure the software path in Chrome (`--encoder software`, P1s must keep sha `97aad066…`);
+   wasm hot spots are 16x16 SATD in the sub-pel search, CABAC `renorm`, `mc_luma` and the
+   half-sample interpolation. `Preset::Speed` stays opt-in (it changes the output).
 
 ## Phase 5 (software H.264 fallback, `crates/h264enc`)
 
