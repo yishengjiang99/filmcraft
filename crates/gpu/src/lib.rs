@@ -50,6 +50,9 @@ pub use async_export::{AsyncExportRenderer, AsyncFrame};
 pub use export_renderer::ExportRenderer;
 pub use lut::GpuLut;
 pub use mask::GpuMask;
+/// The `wgpu` these renderers take devices from, so a caller (a web export worker with a device
+/// of its own) needs no UI crate to name them.
+pub use wgpu;
 
 /// Output texture format: gamma-encoded RGBA8 (what egui expects of native textures); the resolve
 /// shader applies the sRGB encoding.

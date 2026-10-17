@@ -1,4 +1,4 @@
-//! GPU compositing for exports, on eframe's WebGPU device.
+//! GPU compositing for exports, on a WebGPU device (today eframe's).
 //!
 //! Desktop and CLI exports composite on an off-screen device of their own and read every frame
 //! back synchronously ([`filmcraft_gpu::ExportRenderer`]). Neither works on a browser's main
@@ -12,6 +12,9 @@
 //! registered [`FrameRenderer`] is a handle to it. A frame asked for on another thread (none
 //! today: exports step on the UI thread) is declined and renders on the CPU.
 //!
+//! [`install`] takes plain `wgpu` handles, not eframe's: the export worker (Phase 4b) creates a
+//! device of its own and installs it the same way.
+//!
 //! No WebGPU (`?webgl`, `?cpu`, a WebGL2 fallback): the factory returns `None` and exports
 //! composite on the CPU, as do frames the GPU path declines (transitions, adjustment layers, HDR)
 //! and every frame after a GPU error or a lost device.
@@ -19,7 +22,7 @@
 use std::cell::{Cell, RefCell};
 
 use filmcraft_export::{FrameOutcome, FrameRenderer};
-use filmcraft_gpu::{AsyncExportRenderer, AsyncFrame};
+use filmcraft_gpu::{AsyncExportRenderer, AsyncFrame, wgpu};
 use filmcraft_project::{ItemId, Project};
 use filmcraft_render::{Image, RenderOptions, SourceProvider};
 use filmcraft_time::Tick;
@@ -29,8 +32,9 @@ use serde_json::json;
 const READBACK_BUDGET: u64 = 512 << 20;
 
 thread_local! {
-    /// eframe's device and queue, when the UI runs on WebGPU and the GPU compositor is allowed.
-    static DEVICE: RefCell<Option<(eframe::wgpu::Device, eframe::wgpu::Queue)>> = const { RefCell::new(None) };
+    /// The device and queue exports composite on (eframe's, when the UI runs on WebGPU and the GPU
+    /// compositor is allowed).
+    static DEVICE: RefCell<Option<(wgpu::Device, wgpu::Queue)>> = const { RefCell::new(None) };
     /// The renderer of the export in progress (one at a time; keyed by its handle's id).
     static ACTIVE: RefCell<Option<(u64, AsyncExportRenderer)>> = const { RefCell::new(None) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
@@ -42,8 +46,9 @@ thread_local! {
     static LAST_FX: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-/// Offer GPU export rendering on `device` (called once at start-up, WebGPU only).
-pub fn install(device: &eframe::wgpu::Device, queue: &eframe::wgpu::Queue) {
+/// Offer GPU export rendering on `device` (called once at start-up, WebGPU only). Any device works;
+/// nothing here touches the UI's resources.
+pub fn install(device: &wgpu::Device, queue: &wgpu::Queue) {
     DEVICE.with(|d| *d.borrow_mut() = Some((device.clone(), queue.clone())));
     filmcraft_export::register_frame_renderer(factory);
 }

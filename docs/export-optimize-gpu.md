@@ -329,7 +329,7 @@ context. (State on 2026-10-17: `filmcraft_gpu::AsyncExportRenderer::new(device, 
 already takes any device and `async_readback_matches_sync` builds it on a fresh one; what is
 still tied to eframe is the web glue, `apps/filmcraft-web/src/gpu_export.rs`, which stores
 `eframe::wgpu` handles and is installed from `start()`. Make its `install` take a plain
-`wgpu::Device`/`Queue` so a worker can call it.) **Measure, don't assume, zero-copy:** record per-frame time from canvas present to
+`wgpu::Device`/`Queue` so a worker can call it. Done: `install` takes plain `wgpu` handles, `filmcraft_gpu::wgpu`.) **Measure, don't assume, zero-copy:** record per-frame time from canvas present to
 `VideoEncoder.encode()` return, and compare against the `mapAsync` readback path; Chrome
 does not document `new VideoFrame(webgpuCanvas)` as copy-free. *Target: P3 4K wall time
 ≥ 2.5× faster than Phase 1 with the CPU compositor; PSNR gates hold.* (Phase 1 never measured
