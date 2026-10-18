@@ -96,6 +96,10 @@ Export CI's three failures were fixed in `f124b8c3`: the flaky
 entry missing the `MimeType` line the packaged one gained in `69a6c4b6`, and
 `graphics::windows_default_leaves_out_gl` assuming eframe's default backends while Export CI sets
 `WGPU_BACKEND=vulkan`.
+Then `10b04aee` moved `hardware_decoding_setting_drives_the_decoder_switch` to its own test binary
+(`crates/engine/tests/`: it checks a process-wide switch that every `set_prefs` writes), and
+Export CI's concurrency group is now per event, so a push no longer cancels a running full suite
+(it had cancelled the dispatched run 39065995768).
 
 ## Known unrelated failures
 
