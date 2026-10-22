@@ -257,6 +257,15 @@ pub fn install_hooks(app: &mut FilmcraftApp) {
         pick(exts, true);
         Vec::new()
     }));
+    // Open Folder…: web/folder-open.js (showDirectoryPicker, else <input webkitdirectory>).
+    app.hooks.open_folder = Some(Box::new(|| {
+        if let Some(w) = web_sys::window()
+            && let Ok(f) = js_sys::Reflect::get(&w, &"filmcraftOpenFolder".into())
+            && let Ok(f) = f.dyn_into::<js_sys::Function>()
+        {
+            let _ = f.call0(&w);
+        }
+    }));
     app.hooks.pick_open_project = Some(Box::new(|| {
         pick(&["fcproj"], false);
         None
