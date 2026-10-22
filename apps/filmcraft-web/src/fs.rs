@@ -40,6 +40,11 @@ enum Entry {
 struct Fs {
     entries: HashMap<String, Entry>,
     blobs: HashMap<u32, web_sys::Blob>,
+    /// Files of a folder opened with showDirectoryPicker: the `FileSystemFileHandle` is the source
+    /// of truth. Each chunk fetch calls `getFile()` (a fresh snapshot of the file on disk), so no
+    /// `File` is kept and a file changed on disk is picked up (its cached chunks are dropped when
+    /// `lastModified`/size differ from the stamp).
+    handles: HashMap<u32, (web_sys::FileSystemFileHandle, f64)>,
     next_id: u32,
     chunks: HashMap<(u32, u64), (Arc<[u8]>, u64)>,
     bytes: usize,
@@ -107,6 +112,39 @@ pub fn register_blob_at(folder: &str, rel: &str, blob: web_sys::Blob) -> String 
         fs.entries.insert(path.clone(), Entry::Blob { id, size });
     });
     path
+}
+
+/// Register a folder file by its `FileSystemFileHandle` (see `Fs::handles`): `size` and
+/// `last_modified` come from one `getFile()` at registration; bytes are read lazily per chunk.
+pub fn register_handle_at(folder: &str, rel: &str, handle: web_sys::FileSystemFileHandle, size: u64, last_modified: f64) -> String {
+    let mut path = format!("/files/{}", clean_segment(folder));
+    for seg in rel.split('/').filter(|s| !s.is_empty()) {
+        path.push('/');
+        path.push_str(&clean_segment(seg));
+    }
+    FS.with(|fs| {
+        let mut fs = fs.borrow_mut();
+        let id = fs.next_id;
+        fs.next_id += 1;
+        fs.handles.insert(id, (handle, last_modified));
+        fs.entries.insert(path.clone(), Entry::Blob { id, size });
+    });
+    path
+}
+
+/// The current `File` of a path (Blob entries as they are; handle entries via `getFile()`).
+pub async fn blob_async(path: &str) -> Option<web_sys::Blob> {
+    if let Some(b) = blob(path) {
+        return Some(b);
+    }
+    let h = FS.with(|fs| {
+        let fs = fs.borrow();
+        match fs.entries.get(path)? {
+            Entry::Blob { id, .. } => fs.handles.get(id).map(|(h, _)| h.clone()),
+            Entry::Mem(_) => None,
+        }
+    })?;
+    JsFuture::from(h.get_file()).await.ok()?.dyn_into::<web_sys::Blob>().ok()
 }
 
 /// Add (or mark loaded) an opened folder under Local Drives; returns its path.
@@ -295,6 +333,29 @@ impl Fs {
     }
 }
 
+/// A handle-backed file changed on disk: drop its cached chunks and take the new size/stamp.
+fn changed_on_disk(id: u32, last_modified: f64, size: u64) {
+    FS.with(|fs| {
+        let mut fs = fs.borrow_mut();
+        if let Some(h) = fs.handles.get_mut(&id) {
+            h.1 = last_modified;
+        }
+        let stale: Vec<(u32, u64)> = fs.chunks.keys().filter(|k| k.0 == id).copied().collect();
+        for k in stale {
+            if let Some((v, _)) = fs.chunks.remove(&k) {
+                fs.bytes -= v.len();
+            }
+        }
+        for e in fs.entries.values_mut() {
+            if let Entry::Blob { id: i, size: s } = e
+                && *i == id
+            {
+                *s = size;
+            }
+        }
+    });
+}
+
 /// Start fetching chunk `c` of blob `id` unless it is cached or already on its way.
 fn request(id: u32, c: u64) {
     let blob = FS.with(|fs| {
@@ -307,20 +368,48 @@ fn request(id: u32, c: u64) {
         fs.inflight.insert((id, c));
         Some(blob)
     });
-    let Some(blob) = blob else { return };
-    let size = blob.size() as u64;
-    let (a, b) = (c * CHUNK, ((c + 1) * CHUNK).min(size));
-    let fut = blob.slice_with_f64_and_f64(a as f64, b as f64).map(|s| JsFuture::from(s.array_buffer()));
+    let handle = if blob.is_none() {
+        FS.with(|fs| {
+            let mut fs = fs.borrow_mut();
+            if fs.chunks.contains_key(&(id, c)) || fs.inflight.contains(&(id, c)) {
+                return None;
+            }
+            let h = fs.handles.get(&id)?.clone();
+            fs.failed.remove(&(id, c));
+            fs.inflight.insert((id, c));
+            Some(h)
+        })
+    } else {
+        None
+    };
+    if blob.is_none() && handle.is_none() {
+        return;
+    }
     wasm_bindgen_futures::spawn_local(async move {
-        let r = match fut {
-            Ok(f) => f.await.map(|buf| js_sys::Uint8Array::new(&buf).to_vec()),
-            Err(e) => Err(e),
-        };
+        let r: Result<Vec<u8>, wasm_bindgen::JsValue> = async {
+            let blob = match (blob, handle) {
+                (Some(b), _) => b,
+                (None, Some((h, stamp))) => {
+                    // a fresh snapshot of the file on disk (no File is kept between reads)
+                    let f: web_sys::File = JsFuture::from(h.get_file()).await?.dyn_into()?;
+                    if f.last_modified() != stamp {
+                        changed_on_disk(id, f.last_modified(), f.size() as u64);
+                    }
+                    f.into()
+                }
+                (None, None) => return Err(wasm_bindgen::JsValue::NULL),
+            };
+            let size = blob.size() as u64;
+            let (a, b) = (c * CHUNK, ((c + 1) * CHUNK).min(size));
+            let buf = JsFuture::from(blob.slice_with_f64_and_f64(a as f64, b as f64)?.array_buffer()).await?;
+            Ok(js_sys::Uint8Array::new(&buf).to_vec())
+        }
+        .await;
         let wake = FS.with(|fs| {
             let mut fs = fs.borrow_mut();
             fs.inflight.remove(&(id, c));
             // a blob replaced or dropped meanwhile: discard
-            if fs.blobs.contains_key(&id) {
+            if fs.blobs.contains_key(&id) || fs.handles.contains_key(&id) {
                 match r {
                     Ok(v) => {
                         fs.clock += 1;

@@ -1,4 +1,6 @@
-// Open Folder… for the web build (File ▸ Import From ▸ Folder…, Media Browser ▸ Local Drives ▸ Open Folder…,
+// Open Folder… for the web build. Chromium: FileSystemDirectoryHandle/FileSystemFileHandle are the source of truth
+// (registerFolderHandles; the engine calls getFile() per chunk read, so disk edits are seen and no File is held).
+// (File ▸ Import From ▸ Folder…, Media Browser ▸ Local Drives ▸ Open Folder…,
 // Import ▸ Folder…). The engine calls window.filmcraftOpenFolder(); files are registered lazily with
 // filmcraft.registerFolder(name, [[relPath, File], …]) under /files/<name>/… (nothing is read or uploaded:
 // the engine fetches 1 MiB chunks on demand). Chromium: showDirectoryPicker, handle kept in IndexedDB
@@ -26,19 +28,19 @@
       if (out.length >= MAX_FILES) return;
       if (name.startsWith(".")) continue;
       if (h.kind === "directory") await walk(h, prefix + name + "/", out);
-      else if (MEDIA.test(name)) out.push([prefix + name, await h.getFile()]); // a File: metadata only, not read
+      else if (MEDIA.test(name)) { const f = await h.getFile(); out.push([prefix + name, h, f.size, f.lastModified]); } // size/stamp only; the handle is kept, not the File
     }
   }
-  async function show(name, entries) {
+  async function show(name, entries, handles) {
     const fc = window.filmcraft;
-    const r = fc.registerFolder(name, entries);
+    const r = handles ? fc.registerFolderHandles(name, entries) : fc.registerFolder(name, entries);
     try { await fc.request("ui.panel.show", { panel: "MediaBrowser" }); } catch {}
     try { await fc.execute("mediaBrowser.navigate", { path: r.dir }); } catch {}
     return r;
   }
   async function fromHandle(handle) {
     const entries = []; await walk(handle, "", entries);
-    return show(handle.name, entries);
+    return show(handle.name, entries, true);
   }
   function viaInput() {
     return new Promise((ok) => {

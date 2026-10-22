@@ -186,7 +186,7 @@ pub fn install() -> Result<(), JsValue> {
         "readFile",
         Closure::<dyn Fn(String) -> js_sys::Promise>::new(|path: String| {
             future_to_promise(caught(async move {
-                let blob = crate::fs::blob(&path).ok_or_else(|| JsValue::from_str(&format!("{path}: not found")))?;
+                let blob = crate::fs::blob_async(&path).await.ok_or_else(|| JsValue::from_str(&format!("{path}: not found")))?;
                 let buf = JsFuture::from(blob.array_buffer()).await?;
                 Ok(js_sys::Uint8Array::new(&buf).into())
             }))
@@ -204,6 +204,24 @@ pub fn install() -> Result<(), JsValue> {
                 let pair = js_sys::Array::from(&e);
                 let (Some(rel), Ok(file)) = (pair.get(0).as_string(), pair.get(1).dyn_into::<web_sys::Blob>()) else { continue };
                 crate::fs::register_blob_at(&name, &rel, file);
+                n += 1;
+            }
+            let dir = crate::fs::add_folder_root(&name, true);
+            to_js(&json!({"dir": dir, "count": n}))
+        })
+        .into_js_value(),
+    )?;
+    // Open Folder… with showDirectoryPicker: entries = [[relPath, FileSystemFileHandle, size, lastModified], …].
+    // The handles stay the source of truth (getFile() per chunk read); nothing is copied.
+    set_fn(
+        &obj,
+        "registerFolderHandles",
+        Closure::<dyn Fn(String, JsValue) -> JsValue>::new(|name: String, entries: JsValue| {
+            let mut n = 0;
+            for e in js_sys::Array::from(&entries).iter() {
+                let a = js_sys::Array::from(&e);
+                let (Some(rel), Ok(h)) = (a.get(0).as_string(), a.get(1).dyn_into::<web_sys::FileSystemFileHandle>()) else { continue };
+                crate::fs::register_handle_at(&name, &rel, h, a.get(2).as_f64().unwrap_or(0.0) as u64, a.get(3).as_f64().unwrap_or(0.0));
                 n += 1;
             }
             let dir = crate::fs::add_folder_root(&name, true);
