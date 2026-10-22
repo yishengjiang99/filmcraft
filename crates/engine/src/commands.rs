@@ -1306,22 +1306,14 @@ fn build() -> Vec<CommandSpec> {
             Label::Lavender,
             p
         )),
-        cmd!(
-            "file.importFolder",
-            "Folder…",
-            ["File", "Import From"],
-            None,
-            r#"{"path":str}"#,
-            always,
-            |s, p| {
-                // The frontend asks for the folder (web: the browser's folder picker) and passes it
-                // here; the Media Browser then shows it (its Import makes a folder a bin, sub-folders bins).
-                let Some(path) = str_p(p, "path") else {
-                    return Err(bad("file.importFolder", "choose a folder (the app opens a folder picker)"));
-                };
-                s.execute("mediaBrowser.navigate", json!({"path": path}))
-            }
-        ),
+        cmd!("file.importFolder", "Folder…", ["File", "Import From"], None, r#"{"path":str}"#, always, |s, p| {
+            // The frontend asks for the folder (web: the browser's folder picker) and passes it
+            // here; the Media Browser then shows it (its Import makes a folder a bin, sub-folders bins).
+            let Some(path) = str_p(p, "path") else {
+                return Err(bad("file.importFolder", "choose a folder (the app opens a folder picker)"));
+            };
+            s.execute("mediaBrowser.navigate", json!({"path": path}))
+        }),
         cmd!(
             "file.importDemoFootage",
             "Demo Footage",
