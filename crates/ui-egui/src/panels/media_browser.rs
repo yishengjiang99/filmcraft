@@ -278,6 +278,13 @@ fn tree(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, dir: &str) {
             if list.is_empty() {
                 ui.label(egui::RichText::new(tl!("  (none)")).size(10.5).color(app.tokens.text_faint));
             }
+            if key == "localDrives" && app.hooks.open_folder.is_some() {
+                let b = ui.add(egui::Button::new(egui::RichText::new(tl!("  + Open Folder…")).size(11.5)).frame(false));
+                app.auto.add("mediaBrowser.openFolder", b.rect, tl!("Open Folder…"));
+                if b.clicked() {
+                    let _ = crate::menus::open_folder(app, &ctx);
+                }
+            }
             for (name, path) in list {
                 let expandable = matches!(key, "localDrives" | "network" | "favorites");
                 node(app, ui, &ctx, &name, &path, icon, 0, expandable, dir, key, &mut go);

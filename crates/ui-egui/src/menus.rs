@@ -237,6 +237,9 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut params:
         ctx.request_repaint();
         return Ok(json!(app.ui.language));
     }
+    if id == "file.importFolder" && params.get("path").is_none() {
+        return open_folder(app, ctx);
+    }
     if id == "file.exportFrame" {
         if params.get("target").is_none() {
             let source = targets_source(app, &params);
@@ -1103,4 +1106,20 @@ mod tests {
         assert!(harness.query_by_label_contains("Save All").is_none(), "File menu should close");
         assert!(harness.query_by_label_contains("Undo").is_some(), "Edit menu should open on hover");
     }
+}
+
+/// File ▸ Import From ▸ Folder… / Media Browser ▸ Open Folder…: the host's folder opener (web), else
+/// the native folder picker; either way the Media Browser shows the folder.
+pub fn open_folder(app: &mut FilmcraftApp, ctx: &egui::Context) -> Result<Value, String> {
+    app.show_panel(PanelKind::MediaBrowser);
+    if let Some(f) = app.hooks.open_folder.as_mut() {
+        f();
+        return Ok(Value::Null);
+    }
+    let Some(path) = app.hooks.pick_folder.as_mut().and_then(|f| f()) else {
+        return Ok(Value::Null);
+    };
+    let r = app.session.execute("file.importFolder", json!({"path": path})).map_err(|e| e.to_string());
+    ctx.request_repaint();
+    r
 }

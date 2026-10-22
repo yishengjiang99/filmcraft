@@ -327,3 +327,14 @@ fn ale_logs_are_not_offered_for_import() {
     assert!(!media_browser::extensions().contains(&"ale"));
     assert_eq!(media_browser::kind_of("cut.edl"), Some("project"));
 }
+
+/// File ▸ Import From ▸ Folder…: the frontend picks the folder; the command shows it in the Media
+/// Browser (and wants a path).
+#[test]
+fn import_folder_navigates_the_media_browser() {
+    let mut s = session();
+    assert!(s.execute("file.importFolder", json!({})).is_err());
+    s.execute("file.importFolder", json!({"path": "/home/me/Movies"})).unwrap();
+    let l = s.execute("mediaBrowser.list", json!({})).unwrap();
+    assert_eq!(l["dir"], "/home/me/Movies");
+}

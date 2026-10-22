@@ -21,6 +21,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let ctx = ui.ctx().clone();
     let cards = [
         (tl!("Browse files…"), "file.import", tl!("Movies, audio and stills from disk")),
+        (tl!("Folder…"), "file.importFolder", tl!("Browse a folder from your computer")),
         (tl!("Demo footage"), "file.importDemoFootage", tl!("Six procedural 1080p clips with sound")),
         (tl!("Demo project"), "file.openDemoProject", tl!("A cut sequence with transitions, effects and music")),
         (tl!("Bars and Tone"), "file.newBarsAndTone", tl!("SMPTE HD bars with 1 kHz reference tone")),
@@ -36,12 +37,13 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         crate::icons::paint(
             ui.painter(),
             Rect::from_min_size(r.min + vec2(16.0, 18.0), vec2(56.0, 56.0)),
-            [crate::icons::Icon::Folder, crate::icons::Icon::Film, crate::icons::Icon::Sequence, crate::icons::Icon::Grid][i],
+            [crate::icons::Icon::Folder, crate::icons::Icon::Folder, crate::icons::Icon::Film, crate::icons::Icon::Sequence, crate::icons::Icon::Grid][i],
             Color32::from_rgb(140, 150, 255),
         );
         if resp.clicked() {
             let _ = crate::menus::invoke(app, &ctx, cmd, json!({}));
             app.ui.mode = crate::state::Mode::Edit;
+
         }
     }
     let y = recent(app, ui, rect, 90.0 + 150.0 + 36.0);

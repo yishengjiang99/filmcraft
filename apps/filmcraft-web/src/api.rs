@@ -193,6 +193,30 @@ pub fn install() -> Result<(), JsValue> {
         })
         .into_js_value(),
     )?;
+    // Open Folder… (web/folder-open.js): register a picked folder's files lazily under
+    // /files/<name>/<relative path> and show it in the Media Browser. entries = [[relPath, File], …].
+    set_fn(
+        &obj,
+        "registerFolder",
+        Closure::<dyn Fn(String, JsValue) -> JsValue>::new(|name: String, entries: JsValue| {
+            let mut n = 0;
+            for e in js_sys::Array::from(&entries).iter() {
+                let pair = js_sys::Array::from(&e);
+                let (Some(rel), Ok(file)) = (pair.get(0).as_string(), pair.get(1).dyn_into::<web_sys::Blob>()) else { continue };
+                crate::fs::register_blob_at(&name, &rel, file);
+                n += 1;
+            }
+            let dir = crate::fs::add_folder_root(&name, true);
+            to_js(&json!({"dir": dir, "count": n}))
+        })
+        .into_js_value(),
+    )?;
+    // A remembered folder (IndexedDB handle) listed under Local Drives before it is reopened.
+    set_fn(
+        &obj,
+        "addFolderRoot",
+        Closure::<dyn Fn(String) -> JsValue>::new(|name: String| to_js(&json!(crate::fs::add_folder_root(&name, false)))).into_js_value(),
+    )?;
     set_fn(
         &obj,
         "importFiles",

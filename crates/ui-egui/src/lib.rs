@@ -138,6 +138,10 @@ pub struct HostHooks {
     pub system_languages: Option<Box<dyn Fn() -> Vec<String>>>,
     /// Open dialog for a JSON file (shortcut preset import): filter name, extensions → path.
     pub pick_open_file: Option<Box<dyn FnMut(&str, &[&str]) -> Option<String>>>,
+    /// Open a local folder in the Media Browser (File ▸ Import From ▸ Folder…, Media Browser ▸ Open
+    /// Folder…). The web build opens the browser's folder picker and registers the files lazily;
+    /// without it the UI falls back to [`Self::pick_folder`] and navigates the Media Browser there.
+    pub open_folder: Option<Box<dyn FnMut()>>,
     /// Folder picker (Link Media search, proxy and Project Manager destinations).
     pub pick_folder: Option<Box<dyn FnMut() -> Option<String>>>,
     /// Folder picker starting at the current destination (Export Frame).

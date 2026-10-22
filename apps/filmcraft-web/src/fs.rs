@@ -52,7 +52,17 @@ struct Fs {
     on_write: Option<Rc<dyn Fn(&str, &[u8])>>,
 }
 
+/// A local folder opened with Open Folder… (Media Browser ▸ Local Drives): `loaded` once its files
+/// are registered under `/files/<name>`; a remembered folder (IndexedDB handle) is listed before that
+/// and loaded when the user opens it (the page asks for permission again).
+struct FolderRoot {
+    name: String,
+    loaded: bool,
+    requested: bool,
+}
+
 thread_local! {
+    static ROOTS: RefCell<Vec<FolderRoot>> = const { RefCell::new(Vec::new()) };
     static FS: RefCell<Fs> = RefCell::new(Fs::default());
     static DOWNLOADS: RefCell<crate::download_pacing::Pacer> = RefCell::new(crate::download_pacing::Pacer::default());
 }
@@ -69,6 +79,73 @@ pub fn set_on_write(f: impl Fn(&str, &[u8]) + 'static) {
 
 fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+fn clean_segment(s: &str) -> String {
+    let c: String = s.chars().map(|c| if c == '\\' || c.is_control() { '_' } else { c }).collect();
+    match c.trim() {
+        "" | "." | ".." => "_".into(),
+        t => t.to_string(),
+    }
+}
+
+/// Register a file of an opened folder at `/files/<folder>/<rel>` (sub-folders kept). Like
+/// [`register_blob`], nothing is read now: the bytes are fetched lazily in chunks. An existing
+/// entry at that path is replaced (reopening a folder).
+pub fn register_blob_at(folder: &str, rel: &str, blob: web_sys::Blob) -> String {
+    let mut path = format!("/files/{}", clean_segment(folder));
+    for seg in rel.split('/').filter(|s| !s.is_empty()) {
+        path.push('/');
+        path.push_str(&clean_segment(seg));
+    }
+    let size = blob.size() as u64;
+    FS.with(|fs| {
+        let mut fs = fs.borrow_mut();
+        let id = fs.next_id;
+        fs.next_id += 1;
+        fs.blobs.insert(id, blob);
+        fs.entries.insert(path.clone(), Entry::Blob { id, size });
+    });
+    path
+}
+
+/// Add (or mark loaded) an opened folder under Local Drives; returns its path.
+pub fn add_folder_root(name: &str, loaded: bool) -> String {
+    let name = clean_segment(name);
+    ROOTS.with(|r| {
+        let mut r = r.borrow_mut();
+        match r.iter_mut().find(|f| f.name == name) {
+            Some(f) => {
+                f.loaded |= loaded;
+                f.requested = false;
+            }
+            None => r.push(FolderRoot { name: name.clone(), loaded, requested: false }),
+        }
+    });
+    format!("/files/{name}")
+}
+
+/// A remembered folder not loaded yet: ask the page to reopen it (once per visit).
+fn maybe_reopen(dir: &str) {
+    let Some(rest) = dir.strip_prefix("/files/") else { return };
+    let top = rest.split('/').next().unwrap_or_default().to_string();
+    let ask = ROOTS.with(|r| {
+        let mut r = r.borrow_mut();
+        match r.iter_mut().find(|f| f.name == top && !f.loaded && !f.requested) {
+            Some(f) => {
+                f.requested = true;
+                true
+            }
+            None => false,
+        }
+    });
+    if ask
+        && let Some(w) = web_sys::window()
+        && let Ok(f) = js_sys::Reflect::get(&w, &"filmcraftReopenFolder".into())
+        && let Ok(f) = f.dyn_into::<js_sys::Function>()
+    {
+        let _ = f.call1(&w, &top.into());
+    }
 }
 
 /// Register a browser `File` (or named `Blob`) at an unused virtual path; collisions get numbered names.
@@ -387,6 +464,7 @@ impl Services for WebServices {
     /// The Media Browser lists the virtual file table: picked and dropped files under `/files`.
     fn list_entries(&self, dir: &str) -> Option<io::Result<Vec<filmcraft_engine::media_browser::DirEntry>>> {
         use filmcraft_engine::media_browser::DirEntry;
+        maybe_reopen(dir);
         let prefix = if dir.ends_with('/') { dir.to_string() } else { format!("{dir}/") };
         let out = FS.with(|fs| {
             let fs = fs.borrow();
@@ -419,6 +497,16 @@ impl Services for WebServices {
 
     fn home_dir(&self) -> Option<String> {
         Some("/files".into())
+    }
+
+    /// Local Drives: the folders opened with Open Folder… (and remembered ones).
+    fn volumes(&self) -> Vec<filmcraft_engine::media_browser::Volume> {
+        ROOTS.with(|r| {
+            r.borrow()
+                .iter()
+                .map(|f| filmcraft_engine::media_browser::Volume { name: f.name.clone(), path: format!("/files/{}", f.name), ..Default::default() })
+                .collect()
+        })
     }
 }
 
