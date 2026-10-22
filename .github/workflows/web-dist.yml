@@ -1,4 +1,4 @@
-# Web build artifact: `cargo xtask web` (wasm32 + wasm-bindgen) uploaded as `filmcraft-web-dist`, plus the
+# Web build artifact: `cargo xtask web --threads` (single-threaded + threaded mt/, wasm32 + wasm-bindgen) uploaded as `filmcraft-web-dist`, plus the
 # Media Browser engine tests and the UI menu tests. Used to deploy grepawk.com/filmcraft when no local
 # wasm toolchain is at hand (scripts/deploy-grepawk.sh --skip-build after unpacking it into target/web/dist).
 name: Web dist
@@ -21,6 +21,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
           rustup default stable
+          rustup toolchain install nightly --profile minimal --target wasm32-unknown-unknown --component rust-src
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -37,7 +38,7 @@ jobs:
       - name: Engine tests (Media Browser)
         run: cargo test -p filmcraft-engine media_browser
       - name: Build web
-        run: cargo xtask web
+        run: cargo xtask web --threads
       - uses: actions/upload-artifact@v4
         with:
           name: filmcraft-web-dist
